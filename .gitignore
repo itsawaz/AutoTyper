@@ -10,6 +10,7 @@ venv/
 env/
 .env/
 
+
 # SQLite database (contains personal usage data — don't share)
 *.db
 *.sqlite
@@ -25,6 +26,7 @@ env/
 .idea/
 *.swp
 *.swo
+TEST.TXT
 
 # Logs
 *.log
