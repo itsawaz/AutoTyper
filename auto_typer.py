@@ -31,7 +31,8 @@ daily_limit_secs = HARD_LIMIT_SECS
 # Global state
 # ──────────────────────────────────────────────
 is_running = False
-active_typing_time = 0.0          # seconds of active typing in current ON window
+active_typing_time = 0.0          # total active seconds in current ON window (saved to DB)
+typing_since_break = 0.0          # seconds since last break (resets after each break)
 current_session_id = None         # row-id of the active session in DB
 
 # Controller to simulate key presses
@@ -368,7 +369,7 @@ def human_press_backspace():
 # ──────────────────────────────────────────────
 def typing_worker():
     """Worker thread that handles typing/backspacing with automatic breaks."""
-    global is_running, active_typing_time
+    global is_running, active_typing_time, typing_since_break
 
     cycle_start = None        # tracks start of each command cycle (for partial-cycle accounting)
     shuffled_pool = list(rpgle_cl_commands)
@@ -381,7 +382,7 @@ def typing_worker():
     while True:
         if is_running:
             # ── Automatic break check ──────────────────────────
-            if active_typing_time >= next_break_threshold:
+            if typing_since_break >= next_break_threshold:
                 break_duration = random.uniform(MIN_BREAK_DURATION, MAX_BREAK_DURATION)
                 print(f"\n[Break] Taking an automatic break for {break_duration / 60:.2f} minutes...")
 
@@ -391,7 +392,7 @@ def typing_worker():
                         break
                     time.sleep(1.0)
 
-                active_typing_time = 0.0
+                typing_since_break = 0.0   # only reset the break timer, NOT total session time
                 next_break_threshold = random.uniform(MIN_TYPING_BEFORE_BREAK, MAX_TYPING_BEFORE_BREAK)
 
                 if not is_running:
@@ -443,14 +444,17 @@ def typing_worker():
                 time.sleep(random.uniform(2.0, 5.0))
 
             cycle_duration = time.time() - cycle_start
-            active_typing_time += cycle_duration
+            active_typing_time += cycle_duration   # cumulative session total
+            typing_since_break += cycle_duration   # break scheduling counter
             partial_accounted = True
             cycle_start = None
 
         else:
             # If we were mid-cycle when toggled off, count the partial time now
             if cycle_start is not None:
-                active_typing_time += time.time() - cycle_start
+                partial = time.time() - cycle_start
+                active_typing_time += partial   # cumulative session total
+                typing_since_break += partial   # break scheduling counter
                 cycle_start = None
             time.sleep(0.1)
 
@@ -466,7 +470,8 @@ def toggle_typing():
 
     if is_running:
         # ── Turning ON ────────────────────────────────────────
-        active_typing_time = 0.0
+        active_typing_time = 0.0   # reset both counters for a fresh session
+        typing_since_break = 0.0
         current_session_id = db_start_session()
         print(f"\n[AutoTyper] ▶ STARTED  at {_now_str()}  (session #{current_session_id})")
         print("[Timer] Active typing session timer reset.")
