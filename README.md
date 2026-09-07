@@ -41,7 +41,7 @@ pip install pyautogui pynput
 
 ```bash
 source venv/bin/activate
-python3 auto_typer.py
+Y
 ```
 
 Then press **Ctrl + Shift + 1** to start/stop typing.

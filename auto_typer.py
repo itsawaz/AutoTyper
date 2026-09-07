@@ -8,6 +8,8 @@ from datetime import datetime
 import pyautogui
 from pynput import keyboard
 
+pyautogui.FAILSAFE = False  # Prevent FailSafeException when mouse moves to screen corners
+
 # ──────────────────────────────────────────────
 # Break configurations (in seconds)
 # Default: 15-20 min of typing before a 2-5 min break
@@ -31,7 +33,9 @@ daily_limit_secs = HARD_LIMIT_SECS
 # Global state
 # ──────────────────────────────────────────────
 is_running = False
-active_typing_time = 0.0          # total active seconds in current ON window (saved to DB)
+is_on_break = False
+active_typing_time = 0.0          # accumulated active seconds (excluding breaks)
+session_segment_start: float = 0.0 # wall-clock time.time() of current active segment
 typing_since_break = 0.0          # seconds since last break (resets after each break)
 current_session_id = None         # row-id of the active session in DB
 
@@ -153,9 +157,18 @@ def _fmt_duration(secs) -> str:
 # ──────────────────────────────────────────────
 # Daily-limit helpers
 # ──────────────────────────────────────────────
+def _active_session_secs() -> float:
+    """Seconds elapsed in the currently-running session (0 if not running), excluding breaks."""
+    if is_running:
+        if not is_on_break and session_segment_start > 0:
+            return active_typing_time + (time.time() - session_segment_start)
+        return active_typing_time
+    return 0.0
+
+
 def get_current_daily_total() -> float:
     """Completed DB sessions today + the active session so far."""
-    return db_daily_total(_today_str()) + active_typing_time
+    return db_daily_total(_today_str()) + _active_session_secs()
 
 
 def check_daily_limit_on_start() -> bool:
@@ -205,14 +218,16 @@ def check_daily_limit_on_start() -> bool:
 
 def _force_stop_and_exit(reason: str):
     """Save current session, print summary, then hard-exit the process."""
-    global is_running, current_session_id, active_typing_time
+    global is_running, current_session_id
 
+    # Capture duration BEFORE setting is_running=False, otherwise _active_session_secs() returns 0
+    duration = _active_session_secs()
     is_running = False   # stop the typing worker immediately
 
     if current_session_id is not None:
-        db_end_session(current_session_id, active_typing_time)
+        db_end_session(current_session_id, duration)
         print(f"[DB] Session #{current_session_id} saved — "
-              f"active time: {_fmt_duration(active_typing_time)}")
+              f"active time: {_fmt_duration(duration)}")
         current_session_id = None
 
     db_print_daily_summary(_today_str())
@@ -250,7 +265,7 @@ def live_counter():
         time.sleep(1)
 
         if is_running:
-            session_secs = active_typing_time
+            session_secs = _active_session_secs()   # wall-clock elapsed since ON
             # Read only completed sessions from DB (cheap indexed query)
             completed    = db_daily_total(_today_str())
             daily_total  = completed + session_secs
@@ -369,9 +384,13 @@ def human_press_backspace():
 # ──────────────────────────────────────────────
 def typing_worker():
     """Worker thread that handles typing/backspacing with automatic breaks."""
-    global is_running, active_typing_time, typing_since_break
+    global is_running, typing_since_break, is_on_break, active_typing_time, session_segment_start
 
-    cycle_start = None        # tracks start of each command cycle (for partial-cycle accounting)
+    # typing_since_break is still tracked per-cycle for break scheduling.
+    # Total session time is now derived from wall-clock (session_segment_start),
+    # accumulated in active_typing_time.
+    cycle_since_break_start = None   # wall-clock start of current cycle (for break counter only)
+
     shuffled_pool = list(rpgle_cl_commands)
     random.shuffle(shuffled_pool)
     index = 0
@@ -383,6 +402,13 @@ def typing_worker():
         if is_running:
             # ── Automatic break check ──────────────────────────
             if typing_since_break >= next_break_threshold:
+                is_on_break = True
+                
+                # Commit the current active segment time before starting the break
+                if session_segment_start > 0:
+                    active_typing_time += time.time() - session_segment_start
+                    session_segment_start = 0.0
+                
                 break_duration = random.uniform(MIN_BREAK_DURATION, MAX_BREAK_DURATION)
                 print(f"\n[Break] Taking an automatic break for {break_duration / 60:.2f} minutes...")
 
@@ -392,7 +418,14 @@ def typing_worker():
                         break
                     time.sleep(1.0)
 
-                typing_since_break = 0.0   # only reset the break timer, NOT total session time
+                is_on_break = False
+                
+                # Resume tracking if still running
+                if is_running:
+                    session_segment_start = time.time()
+
+                typing_since_break = 0.0   # reset break counter only
+                cycle_since_break_start = None
                 next_break_threshold = random.uniform(MIN_TYPING_BEFORE_BREAK, MAX_TYPING_BEFORE_BREAK)
 
                 if not is_running:
@@ -402,8 +435,7 @@ def typing_worker():
                     print(f"[Break] Done! Resuming. Next break in {next_break_threshold / 60:.2f} min.")
 
             # ── Type one command ───────────────────────────────
-            cycle_start = time.time()
-            partial_accounted = False   # ensure we don't double-count
+            cycle_since_break_start = time.time()
 
             if index >= len(shuffled_pool):
                 random.shuffle(shuffled_pool)
@@ -443,19 +475,17 @@ def typing_worker():
             if is_running:
                 time.sleep(random.uniform(2.0, 5.0))
 
-            cycle_duration = time.time() - cycle_start
-            active_typing_time += cycle_duration   # cumulative session total
-            typing_since_break += cycle_duration   # break scheduling counter
-            partial_accounted = True
-            cycle_start = None
+            # Only the break-scheduling counter is updated here;
+            # total session time comes from the wall clock.
+            if cycle_since_break_start is not None:
+                typing_since_break += time.time() - cycle_since_break_start
+                cycle_since_break_start = None
 
         else:
-            # If we were mid-cycle when toggled off, count the partial time now
-            if cycle_start is not None:
-                partial = time.time() - cycle_start
-                active_typing_time += partial   # cumulative session total
-                typing_since_break += partial   # break scheduling counter
-                cycle_start = None
+            # Account for any partial cycle in the break-scheduling counter
+            if cycle_since_break_start is not None:
+                typing_since_break += time.time() - cycle_since_break_start
+                cycle_since_break_start = None
             time.sleep(0.1)
 
 
@@ -464,24 +494,32 @@ def typing_worker():
 # ──────────────────────────────────────────────
 def toggle_typing():
     """Toggles the running state and records session start/end in the DB."""
-    global is_running, active_typing_time, current_session_id
+    global is_running, is_on_break, active_typing_time, session_segment_start, typing_since_break, current_session_id
 
-    is_running = not is_running
-
-    if is_running:
+    if not is_running:
         # ── Turning ON ────────────────────────────────────────
-        active_typing_time = 0.0   # reset both counters for a fresh session
+        is_on_break = False
+        active_typing_time = 0.0
+        session_segment_start = time.time()   # record exact wall-clock start
         typing_since_break = 0.0
+        is_running = True
         current_session_id = db_start_session()
         print(f"\n[AutoTyper] ▶ STARTED  at {_now_str()}  (session #{current_session_id})")
-        print("[Timer] Active typing session timer reset.")
+        print("[Timer] Wall-clock session timer started.")
 
     else:
         # ── Turning OFF ───────────────────────────────────────
+        # IMPORTANT: capture duration BEFORE setting is_running=False,
+        # otherwise _active_session_secs() sees is_running=False and returns 0.
+        duration = _active_session_secs()
+        is_running = False
+        is_on_break = False
+        session_segment_start = 0.0
+
         print(f"\n[AutoTyper] ■ STOPPED  at {_now_str()}")
         if current_session_id is not None:
-            db_end_session(current_session_id, active_typing_time)
-            print(f"[DB] Session #{current_session_id} saved — active time: {_fmt_duration(active_typing_time)}")
+            db_end_session(current_session_id, duration)
+            print(f"[DB] Session #{current_session_id} saved — active time: {_fmt_duration(duration)}")
             current_session_id = None
 
         # Print today's full summary
