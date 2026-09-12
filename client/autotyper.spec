@@ -1,4 +1,4 @@
-# PyInstaller spec for the AutoTyper desktop client.
+# PyInstaller spec for the AutoTyper desktop client (Tkinter GUI).
 # Build a standalone, windowed (no console) app for the current OS:
 #
 #   macOS   :  pyinstaller autotyper.spec        -> dist/AutoTyper.app
@@ -8,27 +8,37 @@
 #   pip install pyinstaller
 #
 # Notes:
-# - pynput and pyautogui pull in platform backends; PyInstaller usually detects
-#   them, but we add a couple of hidden imports defensively.
-# - The backend URL is read at runtime from the AUTOTYPER_API_BASE env var or the
-#   saved config, so the same build works against dev and prod.
+# - The GUI is Tkinter (bundled with Python), so there are no Qt plugins to ship.
+#   PyInstaller includes the Tcl/Tk runtime automatically.
+# - pynput/pyautogui pull in platform backends; we list them defensively.
+# - The backend URL is read at runtime from AUTOTYPER_API_BASE or the saved
+#   config, so one build works against dev and prod.
 
 import sys
 
 block_cipher = None
 
 hidden = [
+    # pynput / pyautogui platform backends
     "pynput.keyboard._darwin",
     "pynput.keyboard._win32",
     "pynput.keyboard._xorg",
     "pynput.mouse._darwin",
     "pynput.mouse._win32",
     "pynput.mouse._xorg",
+    # QR rendering
     "qrcode",
     "qrcode.image.pil",
     "PIL",
     "PIL.Image",
+    "PIL.ImageTk",
     "PIL._imaging",
+    # Tkinter pieces PyInstaller sometimes misses
+    "tkinter",
+    "tkinter.ttk",
+    "tkinter.font",
+    "tkinter.messagebox",
+    "tkinter.simpledialog",
 ]
 
 a = Analysis(
@@ -40,7 +50,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=["PySide6", "shiboken6", "PyQt5", "PyQt6"],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -61,7 +71,7 @@ exe = EXE(
     upx=True,
     console=False,          # windowed app, no terminal
     disable_windowed_traceback=False,
-    argv_emulation=True,    # macOS: forward file-open/args to the app
+    argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
@@ -87,7 +97,8 @@ if sys.platform == "darwin":
         bundle_identifier="com.autotyper.client",
         info_plist={
             "NSHighResolutionCapable": True,
-            # AutoTyper simulates keystrokes, so it needs Accessibility permission.
+            "CFBundleShortVersionString": "1.1.0",
+            # AutoTyper simulates keystrokes and watches for user activity.
             "NSAppleEventsUsageDescription": "AutoTyper simulates typing for you.",
         },
     )

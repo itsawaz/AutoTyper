@@ -1,7 +1,6 @@
-PySide6==6.8.1
+# GUI uses Tkinter, which ships with Python — no GUI package needed.
 pyautogui==0.9.54
 pynput==1.8.2
 httpx==0.28.1
 qrcode==8.0
 pillow==11.0.0
-

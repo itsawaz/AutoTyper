@@ -22,6 +22,9 @@ CONFIG_PATH = APP_DIR / "config.json"
 DEFAULTS = {
     "api_base": DEFAULT_API_BASE,
     "hotkey": "<ctrl>+<shift>+1",  # pynput GlobalHotKeys format
+    # Global hotkey is OFF by default: pynput's macOS listener hard-crashes
+    # (SIGTRAP) without Accessibility permission. The user opts in explicitly.
+    "hotkey_enabled": False,
     "token": "",                    # JWT for the logged-in user
     "email": "",
     # Seconds of no user activity before auto-typing resumes after the user

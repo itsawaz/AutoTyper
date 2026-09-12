@@ -1,454 +1,510 @@
-"""AutoTyper desktop client (PySide6).
+"""AutoTyper desktop client (Tkinter).
 
-Standalone GUI: login/signup, hours balance, recharge (opens the payment page in
-the browser and polls for confirmation), configurable global hotkey, and
-start/stop of the typing engine. Hours are enforced by the backend — this app
-reports active time and stops when the server says the balance is exhausted.
+Screens:
+  AuthScreen      — sign in / create account
+  DashboardScreen — balance, start/stop typing, settings
+  RechargeWindow  — UPI QR for an exact amount + automatic confirmation
+
+Why Tkinter: it ships with Python and needs no native GUI plugins, so the app
+launches reliably everywhere (the previous Qt build failed to load its platform
+plugin on some machines).
+
+Threading rule: all network calls go through TaskRunner, which delivers results
+on the Tk main thread. Widgets are never touched from a worker thread.
 """
 from __future__ import annotations
 
 import logging
-import os
 import sys
-import webbrowser
-
-# Ensure the GUI uses the native platform plugin. Clear any stray QT_QPA_PLATFORM
-# (e.g. "offscreen" left in the environment) that would otherwise start the app
-# headless / fail to show a window. Must happen before QApplication is created.
-if os.environ.get("QT_QPA_PLATFORM"):
-    os.environ.pop("QT_QPA_PLATFORM", None)
-
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QImage, QPixmap
-from PySide6.QtWidgets import (
-    QApplication, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
-    QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
-    QSpinBox, QVBoxLayout, QWidget,
-)
+import tkinter as tk
+from tkinter import messagebox, ttk
 
 import config
+import ui_kit as ui
 from api_client import ApiClient, ApiError
+from async_task import TaskRunner
 from hotkey import HotkeyManager
 from typer_engine import TyperEngine
+from ui_kit import P
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
     stream=sys.stdout,
 )
 log = logging.getLogger("autotyper")
+# httpx/httpcore are very chatty at DEBUG; keep them quiet.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+APP_TITLE = "AutoTyper"
 
 
-def _fmt_hms(secs: float) -> str:
-    secs = int(max(0, secs))
-    h, rem = divmod(secs, 3600)
-    m, s = divmod(rem, 60)
-    if h:
-        return f"{h}h {m}m {s}s"
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
+# ────────────────────────────────────────────────────────────────
+# QR rendering
+# ────────────────────────────────────────────────────────────────
+def make_qr_photo(data: str, box_size: int = 7):
+    """Render `data` to a Tk PhotoImage QR code.
 
-
-def _make_qr_pixmap(data: str, box_size: int = 8):
-    """Render `data` (a upi:// link) to a scannable QPixmap QR code.
-
-    We use qrcode's own PIL renderer (well-tested, produces a clean quiet zone
-    and sharp modules), export it to PNG bytes, and load that into a QPixmap.
-    This avoids hand-rolling pixel data into a QImage, which previously produced
-    an unscannable code. Returns None if the libraries aren't available.
+    Uses qrcode's PIL renderer (clean quiet zone, sharp modules) so the result
+    is reliably scannable, then hands it to Tk via PIL.ImageTk.
     """
     try:
         import io
         import qrcode
         from qrcode.constants import ERROR_CORRECT_M
+        from PIL import Image, ImageTk
     except Exception:
-        log.exception("QR: qrcode import failed")
+        log.exception("QR: missing qrcode/Pillow")
         return None
     try:
-        qr = qrcode.QRCode(
-            error_correction=ERROR_CORRECT_M,
-            border=4,           # spec-minimum quiet zone
-            box_size=box_size,  # pixels per module -> crisp, no rescaling
-        )
+        qr = qrcode.QRCode(error_correction=ERROR_CORRECT_M, border=3,
+                           box_size=box_size)
         qr.add_data(data)
         qr.make(fit=True)
         img = qr.make_image(fill_color="black", back_color="white")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
-        pix = QPixmap()
-        ok = pix.loadFromData(buf.getvalue(), "PNG")
-        if not ok:
-            log.error("QR: QPixmap.loadFromData failed")
-            return None
-        log.debug("QR rendered: %dx%d px", pix.width(), pix.height())
-        return pix
+        buf.seek(0)
+        photo = ImageTk.PhotoImage(Image.open(buf))
+        log.info("QR rendered %dx%d", photo.width(), photo.height())
+        return photo
     except Exception:
-        log.exception("QR: rendering failed")
+        log.exception("QR: render failed")
         return None
 
 
-# ── background worker for one-off API calls ────────────────────
-class Worker(QObject):
-    done = Signal(object)
-    failed = Signal(str)
+# ────────────────────────────────────────────────────────────────
+# Auth screen
+# ────────────────────────────────────────────────────────────────
+class AuthScreen(ttk.Frame):
+    """Sign in / create account."""
 
-    def __init__(self, fn):
-        super().__init__()
-        self._fn = fn
+    def __init__(self, master, app: "AutoTyperApp"):
+        super().__init__(master, style="TFrame", padding=0)
+        self.app = app
+        self._busy = False
 
-    def run(self):
-        log.debug("Worker.run start")
-        try:
-            result = self._fn()
-            log.debug("Worker.run success, emitting done")
-            self.done.emit(result)
-        except ApiError as e:
-            log.warning("Worker.run ApiError: %s", e.message)
-            self.failed.emit(e.message)
-        except Exception as e:  # noqa: BLE001
-            log.exception("Worker.run unexpected error")
-            self.failed.emit(str(e))
+        outer = ttk.Frame(self, style="TFrame", padding=(36, 30))
+        outer.pack(fill="both", expand=True)
 
+        # Brand
+        ttk.Label(outer, text="AutoTyper", style="H1.TLabel").pack(anchor="w")
+        ttk.Label(outer, text="Sign in to use your hours.",
+                  style="Dim.TLabel").pack(anchor="w", pady=(2, 20))
 
-def run_async(parent, fn, on_done=None, on_fail=None):
-    """Run `fn` on a QThread; deliver the result on the UI thread.
+        panel = ui.card(outer, padding=22)
+        panel.pack(fill="x")
 
-    Cleanup is driven by QThread.finished (never by calling thread.wait() from a
-    slot, which blocks the UI thread and can deadlock inside a modal exec loop).
-    Thread/worker refs are held on `parent` until the thread finishes, then
-    released, so nothing is garbage-collected mid-run.
-    """
-    log.debug("run_async: starting thread")
-    thread = QThread(parent)
-    worker = Worker(fn)
-    worker.moveToThread(thread)
-    thread.started.connect(worker.run)
+        ttk.Label(panel, text="Email", style="CardDim.TLabel").pack(anchor="w")
+        self.email = ttk.Entry(panel, width=32)
+        self.email.pack(fill="x", pady=(4, 14))
 
-    # IMPORTANT: worker.done/failed are emitted on the WORKER thread. If we
-    # connect plain Python callables directly, Qt (AutoConnection) runs them on
-    # the worker thread — so touching widgets (e.g. dialog.accept()) crashes /
-    # deadlocks with "Cannot filter events for objects in a different thread".
-    # We marshal every user callback onto the UI thread via QTimer.singleShot(0)
-    # bound to `parent`, which lives on the UI thread.
-    def _deliver(cb, value):
-        QTimer.singleShot(0, parent, lambda: cb(value))
+        ttk.Label(panel, text="Password", style="CardDim.TLabel").pack(anchor="w")
+        self.password = ttk.Entry(panel, width=32, show="•")
+        self.password.pack(fill="x", pady=(4, 4))
+        ttk.Label(panel, text="At least 8 characters",
+                  style="Faint.TLabel").pack(anchor="w")
 
-    def _on_done(value):
-        log.debug("run_async: done received on %s, marshalling to UI thread",
-                  QThread.currentThread())
-        thread.quit()
-        if on_done:
-            _deliver(on_done, value)
+        self.btn_login = ttk.Button(panel, text="Sign in", style="Accent.TButton",
+                                    command=self._login)
+        self.btn_login.pack(fill="x", pady=(18, 8))
+        self.btn_signup = ttk.Button(panel, text="Create account",
+                                     style="Ghost.TButton", command=self._signup)
+        self.btn_signup.pack(fill="x")
 
-    def _on_fail(msg):
-        thread.quit()
-        if on_fail:
-            _deliver(on_fail, msg)
+        self.busy = ttk.Progressbar(outer, mode="indeterminate",
+                                    style="Busy.Horizontal.TProgressbar")
+        self.status = ttk.Label(outer, text="", style="Error.TLabel",
+                                wraplength=340, justify="left")
+        self.status.pack(anchor="w", pady=(14, 0))
 
-    worker.done.connect(_on_done)
-    worker.failed.connect(_on_fail)
+        self.email.focus_set()
+        # Enter submits sign-in.
+        for w in (self.email, self.password):
+            w.bind("<Return>", lambda _e: self._login())
 
-    # Keep strong refs so neither is collected while running.
-    parent._threads = getattr(parent, "_threads", [])
-    entry = (thread, worker)
-    parent._threads.append(entry)
+    # ── helpers ──
+    def _set_busy(self, busy: bool, msg: str = "") -> None:
+        self._busy = busy
+        state = "disabled" if busy else "normal"
+        self.btn_login.configure(state=state)
+        self.btn_signup.configure(state=state)
+        if busy:
+            self.busy.pack(fill="x", pady=(14, 0), before=self.status)
+            self.busy.start(12)
+        else:
+            self.busy.stop()
+            self.busy.pack_forget()
+        self._msg(msg, error=False)
 
-    def _released():
-        worker.deleteLater()
-        try:
-            parent._threads.remove(entry)
-        except ValueError:
-            pass
+    def _msg(self, text: str, error: bool = True) -> None:
+        self.status.configure(text=text,
+                              foreground=P.danger if error else P.text_dim)
 
-    thread.finished.connect(_released)
-    thread.finished.connect(thread.deleteLater)
-    thread.start()
+    def _validate(self) -> tuple[str, str] | None:
+        email = self.email.get().strip()
+        pw = self.password.get()
+        if "@" not in email or "." not in email:
+            self._msg("Enter a valid email address.")
+            return None
+        if len(pw) < 8:
+            self._msg("Password must be at least 8 characters.")
+            return None
+        return email, pw
 
-
-# ── login / signup dialog ──────────────────────────────────────
-class LoginDialog(QDialog):
-    def __init__(self, api: ApiClient, parent=None):
-        super().__init__(parent)
-        self.api = api
-        self.setWindowTitle("AutoTyper — Sign in")
-        self.setModal(True)
-
-        self.email = QLineEdit()
-        self.email.setPlaceholderText("you@example.com")
-        self.password = QLineEdit()
-        self.password.setEchoMode(QLineEdit.Password)
-        self.password.setPlaceholderText("At least 8 characters")
-
-        form = QFormLayout()
-        form.addRow("Email", self.email)
-        form.addRow("Password", self.password)
-
-        self.login_btn = QPushButton("Log in")
-        self.signup_btn = QPushButton("Sign up")
-        self.login_btn.clicked.connect(lambda: self._submit(self.api.login))
-        self.signup_btn.clicked.connect(lambda: self._submit(self.api.signup))
-
-        btns = QHBoxLayout()
-        btns.addWidget(self.login_btn)
-        btns.addWidget(self.signup_btn)
-
-        self.status = QLabel("")
-        self.status.setStyleSheet("color:#c0392b")
-
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addLayout(btns)
-        layout.addWidget(self.status)
-
-    def _set_busy(self, busy: bool):
-        self.login_btn.setEnabled(not busy)
-        self.signup_btn.setEnabled(not busy)
-        self.status.setText("Working…" if busy else "")
-        self.status.setStyleSheet("color:#888" if busy else "color:#c0392b")
-
-    def _submit(self, fn):
-        email = self.email.text().strip()
-        pw = self.password.text()
-        log.debug("submit: email=%r pw_len=%d api_base=%s", email, len(pw),
-                  self.api.base_url)
-        if not email or len(pw) < 8:
-            self.status.setText("Enter an email and a password of 8+ characters.")
+    # ── actions ──
+    def _login(self) -> None:
+        if self._busy:
             return
-        self._set_busy(True)
-        run_async(
-            self,
-            lambda: fn(email, pw),
+        creds = self._validate()
+        if not creds:
+            return
+        email, pw = creds
+        self._set_busy(True, "Signing in…")
+        self.app.tasks.run(
+            lambda: self.app.api.login(email, pw),
             on_done=lambda token: self._ok(email, token),
-            on_fail=self._err,
+            on_fail=self._fail,
+            name="login",
         )
 
-    def _ok(self, email, token):
-        log.debug("signup/login OK, token_len=%d, saving config + accepting",
-                  len(token or ""))
+    def _signup(self) -> None:
+        if self._busy:
+            return
+        creds = self._validate()
+        if not creds:
+            return
+        email, pw = creds
+        self._set_busy(True, "Creating your account…")
+        self.app.tasks.run(
+            lambda: self.app.api.signup(email, pw),
+            on_done=lambda token: self._ok(email, token),
+            on_fail=self._fail,
+            name="signup",
+        )
+
+    def _ok(self, email: str, token: str) -> None:
+        """Runs on the main thread."""
+        log.info("authenticated as %s", email)
         config.update(token=token, email=email)
-        self.accept()
-
-    def _err(self, msg):
-        log.warning("signup/login failed: %s", msg)
+        self.app.api.token = token
         self._set_busy(False)
-        self.status.setText(msg)
+        self.app.show_dashboard()
+
+    def _fail(self, msg: str) -> None:
+        self._set_busy(False)
+        self._msg(msg)
 
 
-# ── recharge dialog ─────────────────────────────────────────────
-class RechargeDialog(QDialog):
-    credited = Signal()
+# ────────────────────────────────────────────────────────────────
+# Recharge window
+# ────────────────────────────────────────────────────────────────
+class RechargeWindow(tk.Toplevel):
+    """Buy hours: reserve an exact amount, show a UPI QR, poll for confirmation."""
 
-    def __init__(self, api: ApiClient, parent=None):
-        super().__init__(parent)
-        self.api = api
-        self.setWindowTitle("Recharge hours")
-        self.setModal(True)
-        self._order_id = None
-        self._upi_uri = ""
+    POLL_MS = 4000
 
-        self.hours = QSpinBox()
-        self.hours.setRange(1, 100)
-        self.hours.setValue(1)
-        self.hours.setSuffix(" hour(s)")
+    def __init__(self, app: "AutoTyperApp"):
+        super().__init__(app.root)
+        self.app = app
+        self.title("Add hours")
+        self.configure(bg=P.bg)
+        self.resizable(False, False)
+        self.transient(app.root)
 
-        self.buy_btn = QPushButton("Buy hours")
-        self.buy_btn.clicked.connect(self._buy)
+        self._order_id: str | None = None
+        self._qr_photo = None          # keep a ref or Tk drops the image
+        self._poll_job: str | None = None
+        self._checking = False
 
-        # QR + amount shown after an order is created.
-        self.qr_label = QLabel()
-        self.qr_label.setAlignment(Qt.AlignCenter)
-        self.qr_label.setVisible(False)
-        self.amount_label = QLabel()
-        self.amount_label.setAlignment(Qt.AlignCenter)
-        self.amount_label.setStyleSheet("font-size:16px; font-weight:600")
+        wrap = ttk.Frame(self, style="TFrame", padding=(28, 24))
+        wrap.pack(fill="both", expand=True)
 
-        self.status = QLabel("Choose how many hours to add, then pay by UPI.")
-        self.status.setWordWrap(True)
-        self.status.setAlignment(Qt.AlignCenter)
+        ttk.Label(wrap, text="Add hours", style="H1.TLabel").pack(anchor="w")
+        ttk.Label(wrap, text="Pay by UPI from your phone. Hours are added "
+                             "automatically once the payment lands.",
+                  style="Dim.TLabel", wraplength=380,
+                  justify="left").pack(anchor="w", pady=(2, 18))
 
-        form = QFormLayout()
-        form.addRow("Hours", self.hours)
+        # ── step 1: choose hours ──
+        self.choose = ui.card(wrap, padding=20)
+        self.choose.pack(fill="x")
+        row = ttk.Frame(self.choose, style="Card.TFrame")
+        row.pack(fill="x")
+        ttk.Label(row, text="Hours", style="Card.TLabel").pack(side="left")
+        self.hours = tk.IntVar(value=1)
+        self.spin = ttk.Spinbox(row, from_=1, to=100, width=6,
+                                textvariable=self.hours, justify="center")
+        self.spin.pack(side="right")
+        self.price_label = ttk.Label(self.choose, text="", style="Faint.TLabel")
+        self.price_label.pack(anchor="w", pady=(10, 0))
+        self.hours.trace_add("write", lambda *_: self._update_price())
+        self._update_price()
 
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(self.buy_btn)
-        layout.addWidget(self.amount_label)
-        layout.addWidget(self.qr_label)
-        layout.addWidget(self.status)
+        self.btn_buy = ttk.Button(self.choose, text="Continue to payment",
+                                  style="Accent.TButton", command=self._buy)
+        self.btn_buy.pack(fill="x", pady=(16, 0))
 
-        # On-demand confirmation polling while the user pays.
-        self._poll = QTimer(self)
-        self._poll.setInterval(4000)
-        self._poll.timeout.connect(self._check_status)
+        # ── step 2: pay (built after the order is created) ──
+        self.pay = ui.card(wrap, padding=20)
+        self.amount_label = ttk.Label(self.pay, text="", style="Display.TLabel")
+        self.vpa_label = ttk.Label(self.pay, text="", style="Faint.TLabel")
+        self.qr_holder = ttk.Label(self.pay, background="#ffffff", padding=8)
+        self.pay_hint = ttk.Label(
+            self.pay,
+            text="Scan with any UPI app (GPay, PhonePe, Paytm) and pay this "
+                 "exact amount — the amount is how we identify your payment.",
+            style="CardDim.TLabel", wraplength=340, justify="center")
+        self.wait_bar = ttk.Progressbar(self.pay, mode="indeterminate",
+                                        style="Busy.Horizontal.TProgressbar")
+        self.result_label = ttk.Label(self.pay, text="", style="Success.TLabel")
 
-    def _buy(self):
-        self.buy_btn.setEnabled(False)
-        self.hours.setEnabled(False)
-        self.status.setText("Creating order…")
-        run_async(
-            self,
-            lambda: self.api.buy_hours(float(self.hours.value())),
+        self.status = ttk.Label(wrap, text="", style="Dim.TLabel",
+                                wraplength=380, justify="left")
+        self.status.pack(anchor="w", pady=(14, 0))
+
+        ui.center_window(self, 440, 330)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+    # ── helpers ──
+    def _update_price(self) -> None:
+        try:
+            h = max(1, int(self.hours.get() or 1))
+        except (tk.TclError, ValueError):
+            return
+        self.price_label.configure(text=f"₹{h * 49:.2f} at ₹49.00 per hour")
+
+    def _msg(self, text: str, error: bool = False) -> None:
+        self.status.configure(text=text,
+                              foreground=P.danger if error else P.text_dim)
+
+    # ── buy ──
+    def _buy(self) -> None:
+        try:
+            hours = float(max(1, int(self.hours.get())))
+        except (tk.TclError, ValueError):
+            self._msg("Enter a valid number of hours.", error=True)
+            return
+        self.btn_buy.configure(state="disabled")
+        self.spin.configure(state="disabled")
+        self._msg("Creating your order…")
+        self.app.tasks.run(
+            lambda: self.app.api.buy_hours(hours),
             on_done=self._order_created,
-            on_fail=self._err,
+            on_fail=self._buy_failed,
+            name="buy",
         )
 
-    def _order_created(self, order):
+    def _buy_failed(self, msg: str) -> None:
+        self.btn_buy.configure(state="normal")
+        self.spin.configure(state="normal")
+        self._msg(msg, error=True)
+
+    def _order_created(self, order: dict) -> None:
+        """Main thread. Show the QR and start polling for confirmation."""
         self._order_id = order["order_id"]
         amount = order["amount_paise"] / 100
-        self._upi_uri = order.get("upi_uri", "")
+        upi_uri = order.get("upi_uri", "")
+        log.info("order %s created for ₹%.2f", self._order_id, amount)
 
-        if self._upi_uri:
-            # UPI flow: show a QR of the exact-amount upi:// link to scan with
-            # a phone (payment happens on the phone, not this computer).
-            self.amount_label.setText(f"Pay exactly ₹{amount:.2f}")
-            pix = _make_qr_pixmap(self._upi_uri)
-            if pix is not None:
-                self.qr_label.setPixmap(pix)
-                self.qr_label.setVisible(True)
-            self.status.setText(
-                "Open any UPI app on your phone (GPay / PhonePe / Paytm), scan "
-                "this QR, and pay the exact amount shown — the amount identifies "
-                "your payment. Keep this window open; your hours are added "
-                "automatically within a minute of paying."
-            )
+        self.choose.pack_forget()
+        self.pay.pack(fill="both", expand=True)
+
+        self.amount_label.configure(text=f"₹{amount:.2f}")
+        self.amount_label.pack(anchor="center")
+        # Show the payee UPI ID (parsed out of the upi:// link) so the user can
+        # verify who they're paying, or pay manually if scanning fails.
+        vpa = ""
+        if upi_uri:
+            from urllib.parse import parse_qs, urlparse
+            vpa = parse_qs(urlparse(upi_uri).query).get("pa", [""])[0]
+        if vpa:
+            self.vpa_label.configure(text=f"to {vpa}")
+            self.vpa_label.pack(anchor="center", pady=(2, 0))
+        if upi_uri:
+            self._qr_photo = make_qr_photo(upi_uri)
+            if self._qr_photo is not None:
+                self.qr_holder.configure(image=self._qr_photo)
+                self.qr_holder.pack(anchor="center", pady=(14, 12))
+            else:
+                self._msg("Couldn't draw the QR code. Pay ₹"
+                          f"{amount:.2f} to the UPI ID shown in your account.",
+                          error=True)
+            self.pay_hint.pack(anchor="center")
         else:
-            # Mock/other flow: open the returned pay page in a browser.
+            # Non-UPI provider (mock): open the hosted pay page instead.
+            import webbrowser
             webbrowser.open(order["pay_url"])
-            self.amount_label.setText(f"₹{amount:.2f}")
-            self.status.setText(
-                f"Opened payment page for ₹{amount:.2f}. Complete it, then wait "
-                "here — your hours are added automatically."
-            )
-        self._poll.start()
+            self.pay_hint.configure(
+                text="A payment page was opened in your browser. Complete it and "
+                     "keep this window open.")
+            self.pay_hint.pack(anchor="center")
 
-    def _check_status(self):
-        if not self._order_id:
+        self.wait_bar.pack(fill="x", pady=(16, 6))
+        self.wait_bar.start(12)
+        self._msg("Waiting for your payment…")
+        ui.center_window(self, 440, 620)
+        self._schedule_poll()
+
+    # ── confirmation polling ──
+    def _schedule_poll(self) -> None:
+        self._poll_job = self.after(self.POLL_MS, self._poll)
+
+    def _poll(self) -> None:
+        if not self._order_id or self._checking:
+            self._schedule_poll()
             return
+        self._checking = True
+        oid = self._order_id
 
         def check():
-            # For UPI, ask the backend to read Gmail now; falls back to plain
-            # status for the mock provider.
+            # Ask the backend to read recent bank alerts now (UPI); fall back to
+            # a plain status read for other providers.
             try:
-                return self.api.upi_check(self._order_id)
+                return self.app.api.upi_check(oid)
             except ApiError:
-                return self.api.order_status(self._order_id)
+                return self.app.api.order_status(oid)
 
-        run_async(
-            self,
-            check,
-            on_done=self._status_result,
-            on_fail=lambda _msg: None,  # keep polling on transient errors
-        )
+        self.app.tasks.run(check, on_done=self._checked,
+                           on_fail=self._check_failed, name="upi-check")
 
-    def _status_result(self, res):
-        if res.get("status") == "paid":
-            self._poll.stop()
-            self.status.setText("✅ Payment confirmed. Hours added.")
-            self.credited.emit()
-            QTimer.singleShot(1200, self.accept)
-        elif res.get("status") == "expired":
-            self._poll.stop()
-            self.status.setText("This order expired. Close and try again.")
-
-    def _err(self, msg):
-        self.buy_btn.setEnabled(True)
-        self.hours.setEnabled(True)
-        self.status.setText(f"Error: {msg}")
-
-
-# ── hotkey capture dialog ───────────────────────────────────────
-class HotkeyDialog(QDialog):
-    def __init__(self, current: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Set launch hotkey")
-        self.setModal(True)
-        self.result_combo = current
-
-        self.field = QLineEdit(current)
-        self.field.setPlaceholderText("<ctrl>+<shift>+1")
-        hint = QLabel(
-            "Use pynput format, e.g. <ctrl>+<shift>+1, <cmd>+<alt>+t.\n"
-            "Modifiers: <ctrl> <alt> <shift> <cmd>."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#888")
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self._accept)
-        buttons.rejected.connect(self.reject)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Launch / toggle hotkey:"))
-        layout.addWidget(self.field)
-        layout.addWidget(hint)
-        layout.addWidget(buttons)
-
-    def _accept(self):
-        combo = self.field.text().strip()
-        # Validate by attempting to construct a listener.
-        try:
-            from pynput import keyboard
-            keyboard.GlobalHotKeys({combo: lambda: None})
-        except Exception:
-            QMessageBox.warning(self, "Invalid hotkey", "That combo isn't valid pynput syntax.")
+    def _checked(self, res: dict) -> None:
+        self._checking = False
+        status = (res or {}).get("status")
+        if status == "paid":
+            self._confirmed()
             return
-        self.result_combo = combo
-        self.accept()
+        if status == "expired":
+            self.wait_bar.stop()
+            self.wait_bar.pack_forget()
+            self._msg("This order expired. Close this window and try again.",
+                      error=True)
+            return
+        self._schedule_poll()
+
+    def _check_failed(self, _msg: str) -> None:
+        self._checking = False
+        self._schedule_poll()   # transient error; keep waiting
+
+    def _confirmed(self) -> None:
+        log.info("order %s confirmed", self._order_id)
+        if self._poll_job:
+            self.after_cancel(self._poll_job)
+            self._poll_job = None
+        self.wait_bar.stop()
+        self.wait_bar.pack_forget()
+        self.qr_holder.pack_forget()
+        self.pay_hint.pack_forget()
+        self.result_label.configure(text="✓  Payment received — hours added")
+        self.result_label.pack(anchor="center", pady=(10, 0))
+        self._msg("")
+        self.app.refresh_balance()
+        self.after(1600, self._close)
+
+    def _close(self) -> None:
+        if self._poll_job:
+            try:
+                self.after_cancel(self._poll_job)
+            except Exception:
+                pass
+            self._poll_job = None
+        self.app.refresh_balance()
+        self.destroy()
 
 
-# ── main window ─────────────────────────────────────────────────
-class MainWindow(QMainWindow):
-    _hb_result = Signal(object)   # backend heartbeat response -> UI thread
-    _hb_error = Signal(str)
+# ────────────────────────────────────────────────────────────────
+# Dashboard
+# ────────────────────────────────────────────────────────────────
+class DashboardScreen(ttk.Frame):
+    """Balance, start/stop typing, and settings."""
 
-    def __init__(self, api: ApiClient, cfg: dict):
-        super().__init__()
-        log.debug("MainWindow.__init__ start")
-        self.api = api
-        self.cfg = cfg
-        self.session_id = None
+    def __init__(self, master, app: "AutoTyperApp"):
+        super().__init__(master, style="TFrame", padding=0)
+        self.app = app
+
+        wrap = ttk.Frame(self, style="TFrame", padding=(28, 22))
+        wrap.pack(fill="both", expand=True)
+
+        # ── header ──
+        head = ttk.Frame(wrap, style="TFrame")
+        head.pack(fill="x")
+        ttk.Label(head, text="AutoTyper", style="H1.TLabel").pack(side="left")
+        self.account_btn = ttk.Button(head, text="Sign out", style="Link.TButton",
+                                      command=self.app.logout)
+        self.account_btn.pack(side="right")
+        self.email_label = ttk.Label(wrap, text="", style="Dim.TLabel")
+        self.email_label.pack(anchor="w", pady=(2, 18))
+
+        # ── balance card ──
+        bal = ui.card(wrap, padding=22)
+        bal.pack(fill="x")
+        ttk.Label(bal, text="TIME REMAINING", style="Faint.TLabel").pack(anchor="w")
+        self.balance_label = ttk.Label(bal, text="—", style="Display.TLabel")
+        self.balance_label.pack(anchor="w", pady=(2, 10))
+        self.meter = ttk.Progressbar(bal, mode="determinate", maximum=100,
+                                     style="Meter.Horizontal.TProgressbar")
+        self.meter.pack(fill="x")
+        srow = ttk.Frame(bal, style="Card.TFrame")
+        srow.pack(fill="x", pady=(14, 0))
+        self.session_label = ttk.Label(srow, text="Idle", style="CardDim.TLabel")
+        self.session_label.pack(side="left")
+        self.add_btn = ttk.Button(srow, text="Add hours", style="Ghost.TButton",
+                                  command=self.app.open_recharge)
+        self.add_btn.pack(side="right")
+
+        # ── primary action ──
+        self.toggle_btn = ttk.Button(wrap, text="Start typing",
+                                     style="Accent.TButton",
+                                     command=self.app.toggle_typing)
+        self.toggle_btn.pack(fill="x", pady=(18, 8))
+        self.status_label = ttk.Label(wrap, text="Ready.", style="Dim.TLabel",
+                                      wraplength=380, justify="left")
+        self.status_label.pack(anchor="w")
+
+        # ── settings ──
+        ui.hairline(wrap).pack(fill="x", pady=16)
+        cfgrow = ttk.Frame(wrap, style="TFrame")
+        cfgrow.pack(fill="x")
+        self.idle_btn = ttk.Button(cfgrow, text="Pause delay",
+                                   style="Ghost.TButton",
+                                   command=self.app.change_idle_resume)
+        self.idle_btn.pack(side="left")
+        self.hotkey_btn = ttk.Button(cfgrow, text="Enable hotkey",
+                                     style="Ghost.TButton",
+                                     command=self.app.toggle_hotkey)
+        self.hotkey_btn.pack(side="left", padx=(8, 0))
+        self.settings_label = ttk.Label(wrap, text="", style="Dim.TLabel")
+        self.settings_label.pack(anchor="w", pady=(10, 0))
+
+
+# ────────────────────────────────────────────────────────────────
+# Application
+# ────────────────────────────────────────────────────────────────
+class AutoTyperApp:
+    def __init__(self) -> None:
+        self.cfg = config.load()
+        self.api = ApiClient(self.cfg["api_base"], token=self.cfg.get("token", ""))
+
+        self.root = tk.Tk()
+        self.root.title(APP_TITLE)
+        self.root.minsize(420, 360)
+        self.F = ui.apply_theme(self.root)
+        ui.center_window(self.root, 440, 560)
+
+        self.tasks = TaskRunner(self.root)
+        self.container = ttk.Frame(self.root, style="TFrame")
+        self.container.pack(fill="both", expand=True)
+
+        self.screen: ttk.Frame | None = None
+        self.dashboard: DashboardScreen | None = None
+
         self.balance_secs = 0.0
+        self.peak_secs = 1.0          # for the meter scale
+        self.session_id: str | None = None
+        self._recharge: RechargeWindow | None = None
 
-        self.setWindowTitle("AutoTyper")
-        self.resize(420, 260)
-
-        self.balance_label = QLabel("Balance: —")
-        self.balance_label.setStyleSheet("font-size:18px; font-weight:600")
-        self.status_label = QLabel("Idle.")
-        self.status_label.setStyleSheet("color:#555")
-        self.hotkey_label = QLabel()
-        self.hotkey_label.setStyleSheet("color:#888")
-
-        self.toggle_btn = QPushButton("Start typing")
-        self.toggle_btn.clicked.connect(self.toggle_typing)
-        self.recharge_btn = QPushButton("Recharge")
-        self.recharge_btn.clicked.connect(self.open_recharge)
-        self.hotkey_btn = QPushButton("Change hotkey")
-        self.hotkey_btn.clicked.connect(self.change_hotkey)
-        self.idle_btn = QPushButton("Idle resume")
-        self.idle_btn.clicked.connect(self.change_idle_resume)
-
-        row = QHBoxLayout()
-        row.addWidget(self.recharge_btn)
-        row.addWidget(self.hotkey_btn)
-        row.addWidget(self.idle_btn)
-
-        central = QWidget()
-        v = QVBoxLayout(central)
-        v.addWidget(self.balance_label)
-        v.addWidget(self.status_label)
-        v.addWidget(self.toggle_btn)
-        v.addLayout(row)
-        v.addWidget(self.hotkey_label)
-        self.setCentralWidget(central)
-
-        # Menu: logout
-        logout = QAction("Log out", self)
-        logout.triggered.connect(self.logout)
-        self.menuBar().addMenu("Account").addAction(logout)
-
-        # Engine + hotkey
+        # Typing engine + hotkey
         self.engine = TyperEngine(
             on_active_seconds=self._report_active_seconds,
             on_status=self._engine_status,
@@ -456,219 +512,245 @@ class MainWindow(QMainWindow):
             idle_resume_secs=float(self.cfg.get("idle_resume_secs", 5.0)),
         )
         self.hotkeys = HotkeyManager()
-        self._hotkey_ok = True
-        # Defer starting the global hotkey listener until AFTER the window is
-        # shown and the event loop is running. On macOS pynput's global listener
-        # can hard-crash if started during construction / before the app is
-        # fully up; deferring lets the window appear first and isolates the risk.
-        self._update_hotkey_label()
-        QTimer.singleShot(300, lambda: self._install_hotkey(self.cfg["hotkey"]))
 
-        # Heartbeat responses come from the engine's worker thread; marshal to UI.
-        self._hb_result.connect(self._on_hb_result)
-        self._hb_error.connect(lambda m: self.status_label.setText(f"Sync issue: {m}"))
+        self.root.protocol("WM_DELETE_WINDOW", self.quit)
+        log.info("AutoTyper starting. api_base=%s", self.cfg["api_base"])
 
+    # ── screen switching ──
+    def _swap(self, screen: ttk.Frame) -> None:
+        if self.screen is not None:
+            self.screen.destroy()
+        self.screen = screen
+        screen.pack(fill="both", expand=True)
+
+    def show_auth(self) -> None:
+        self.dashboard = None
+        ui.center_window(self.root, 440, 470)
+        self._swap(AuthScreen(self.container, self))
+
+    def show_dashboard(self) -> None:
+        self.cfg = config.load()
+        self.dashboard = DashboardScreen(self.container, self)
+        ui.center_window(self.root, 440, 560)
+        self._swap(self.dashboard)
+        self.dashboard.email_label.configure(text=self.cfg.get("email", ""))
+        self._update_settings_label()
         self.refresh_balance()
+        # Start the hotkey only if the user previously enabled it.
+        if self.cfg.get("hotkey_enabled"):
+            self.root.after(400, lambda: self._install_hotkey(self.cfg["hotkey"]))
 
-    # ── balance ────────────────────────────────────────────────
-    def refresh_balance(self):
-        run_async(
-            self,
-            self.api.balance,
-            on_done=self._set_balance,
-            on_fail=lambda m: self.status_label.setText(f"Couldn't load balance: {m}"),
-        )
+    # ── balance ──
+    def refresh_balance(self) -> None:
+        self.tasks.run(self.api.balance, on_done=self._balance_loaded,
+                       on_fail=self._balance_failed, name="balance")
 
-    def _set_balance(self, data):
+    def _balance_loaded(self, data: dict) -> None:
         self.balance_secs = float(data["balance_secs"])
-        self.balance_label.setText(f"Balance: {_fmt_hms(self.balance_secs)}")
-
-    # ── typing toggle ──────────────────────────────────────────
-    def toggle_typing(self):
-        if self.engine.running:
-            self._stop_typing()
-        else:
-            self._start_typing()
-
-    def _start_typing(self):
+        self.peak_secs = max(self.peak_secs, self.balance_secs, 1.0)
+        if not self.dashboard:
+            return
+        self.dashboard.balance_label.configure(
+            text=ui.fmt_hms_long(self.balance_secs))
+        pct = 0 if self.peak_secs <= 0 else min(
+            100, self.balance_secs / self.peak_secs * 100)
+        self.dashboard.meter.configure(value=pct)
         if self.balance_secs <= 0:
-            QMessageBox.information(self, "No hours", "You're out of hours. Please recharge.")
+            self.dashboard.status_label.configure(
+                text="You're out of hours. Add hours to start typing.",
+                foreground=P.warning)
+
+    def _balance_failed(self, msg: str) -> None:
+        if self.dashboard:
+            self.dashboard.status_label.configure(
+                text=f"Couldn't load balance: {msg}", foreground=P.danger)
+
+    # ── typing ──
+    def toggle_typing(self) -> None:
+        if self.engine.running:
+            self.engine.stop("Stopping…")
+            return
+        if self.balance_secs <= 0:
+            messagebox.showinfo(
+                APP_TITLE, "You have no hours left. Add hours to continue.",
+                parent=self.root)
             self.open_recharge()
             return
-        self.toggle_btn.setEnabled(False)
-        self.status_label.setText("Starting session…")
-        run_async(
-            self,
-            self.api.start_session,
-            on_done=self._session_started,
-            on_fail=self._session_start_failed,
-        )
+        self.dashboard.toggle_btn.configure(state="disabled")
+        self.dashboard.status_label.configure(text="Starting session…",
+                                              foreground=P.text_dim)
+        self.tasks.run(self.api.start_session, on_done=self._session_started,
+                       on_fail=self._session_failed, name="session-start")
 
-    def _session_started(self, res):
+    def _session_started(self, res: dict) -> None:
         self.session_id = res["session_id"]
         self.balance_secs = float(res["balance_secs"])
-        self._set_balance({"balance_secs": self.balance_secs})
+        self._balance_loaded({"balance_secs": self.balance_secs})
         self.engine.start()
-        self.toggle_btn.setText("Stop typing")
-        self.toggle_btn.setEnabled(True)
+        d = self.dashboard
+        d.toggle_btn.configure(text="Stop typing", style="Stop.TButton",
+                               state="normal")
+        d.session_label.configure(text="● Typing", foreground=P.success)
+        d.status_label.configure(
+            text="Typing. It pauses automatically when you use the mouse or "
+                 "keyboard.", foreground=P.text_dim)
 
-    def _session_start_failed(self, msg):
-        self.toggle_btn.setEnabled(True)
-        self.status_label.setText(f"Couldn't start: {msg}")
-        if "recharge" in msg.lower() or "no hours" in msg.lower():
+    def _session_failed(self, msg: str) -> None:
+        d = self.dashboard
+        d.toggle_btn.configure(state="normal")
+        d.status_label.configure(text=msg, foreground=P.danger)
+        if "hour" in msg.lower() or "recharge" in msg.lower():
             self.open_recharge()
 
-    def _stop_typing(self):
-        self.engine.stop("Stopping…")
-
     def _report_active_seconds(self, secs: float) -> bool:
-        """Called by the engine thread. Debit on the backend; return True to stop.
-
-        We do the network call synchronously here (we're already off the UI
-        thread) and marshal the result back to the UI via signals.
-        """
+        """Called from the engine thread. Debits on the backend; returns True to
+        stop. Network I/O here is fine (not the UI thread); UI updates are posted
+        back to the main thread."""
         if not self.session_id:
             return False
-        try:
-            res = self.api.heartbeat(self.session_id, secs)
-        except ApiError as e:
-            self._hb_error.emit(e.message)
-            raise  # let the engine re-queue the seconds
-        self._hb_result.emit(res)
+        res = self.api.heartbeat(self.session_id, secs)
+        self.balance_secs = float(res["balance_secs"])
+        self.tasks.post(lambda: self._balance_loaded(
+            {"balance_secs": self.balance_secs}))
         return bool(res.get("should_stop"))
 
-    def _on_hb_result(self, res):
-        self.balance_secs = float(res["balance_secs"])
-        self._set_balance({"balance_secs": self.balance_secs})
+    def _engine_status(self, text: str) -> None:
+        self.tasks.post(lambda: self._set_engine_status(text))
 
-    def _engine_status(self, text):
-        # Marshal to UI thread safely.
-        QTimer.singleShot(0, lambda: self.status_label.setText(text))
+    def _set_engine_status(self, text: str) -> None:
+        if not self.dashboard:
+            return
+        self.dashboard.status_label.configure(text=text, foreground=P.text_dim)
+        low = text.lower()
+        if "paused" in low:
+            self.dashboard.session_label.configure(text="❙❙ Paused",
+                                                   foreground=P.warning)
+        elif "resumed" in low or "typing" in low:
+            self.dashboard.session_label.configure(text="● Typing",
+                                                   foreground=P.success)
 
-    def _engine_stopped(self, reason):
-        def finish():
-            self.toggle_btn.setText("Start typing")
-            self.toggle_btn.setEnabled(True)
-            self.status_label.setText(reason)
-            # Close the session on the backend with any final seconds (0 here;
-            # the engine already flushed them via the heartbeat callback).
-            if self.session_id:
-                sid = self.session_id
-                self.session_id = None
-                run_async(
-                    self,
-                    lambda: self.api.stop_session(sid, 0.0),
-                    on_done=lambda r: self._set_balance(r) if "balance_secs" in r else None,
-                    on_fail=lambda _m: None,
-                )
-            self.refresh_balance()
-        QTimer.singleShot(0, finish)
+    def _engine_stopped(self, reason: str) -> None:
+        self.tasks.post(lambda: self._on_engine_stopped(reason))
 
-    # ── recharge ───────────────────────────────────────────────
-    def open_recharge(self):
-        dlg = RechargeDialog(self.api, self)
-        dlg.credited.connect(self.refresh_balance)
-        dlg.exec()
-        self.refresh_balance()
+    def _on_engine_stopped(self, reason: str) -> None:
+        sid, self.session_id = self.session_id, None
+        if self.dashboard:
+            d = self.dashboard
+            d.toggle_btn.configure(text="Start typing", style="Accent.TButton",
+                                   state="normal")
+            d.session_label.configure(text="Idle", foreground=P.text_dim)
+            d.status_label.configure(text=reason, foreground=P.text_dim)
+        if sid:
+            self.tasks.run(lambda: self.api.stop_session(sid, 0.0),
+                           on_done=lambda _r: self.refresh_balance(),
+                           on_fail=lambda _m: self.refresh_balance(),
+                           name="session-stop")
 
-    # ── hotkey ─────────────────────────────────────────────────
-    def _install_hotkey(self, combo: str):
-        log.debug("installing global hotkey: %r", combo)
-        self._hotkey_ok = True
-        try:
-            self.hotkeys.start(combo, self._hotkey_fired)
-            log.debug("global hotkey listener started")
-        except Exception:
-            log.exception("hotkey listener failed to start (continuing without it)")
-            self._hotkey_ok = False
-        self._update_hotkey_label()
+    # ── recharge ──
+    def open_recharge(self) -> None:
+        if self._recharge is not None and self._recharge.winfo_exists():
+            self._recharge.lift()
+            return
+        self._recharge = RechargeWindow(self)
 
-    def _update_hotkey_label(self):
-        combo = self.cfg.get("hotkey", "")
+    # ── settings ──
+    def _update_settings_label(self) -> None:
+        if not self.dashboard:
+            return
         idle = float(self.cfg.get("idle_resume_secs", 5.0))
-        if getattr(self, "_hotkey_ok", True):
-            self.hotkey_label.setText(f"Hotkey: {combo}   ·   Resume after {idle:g}s idle")
-        else:
-            self.hotkey_label.setText(f"Hotkey '{combo}' invalid — set a new one.")
+        on = bool(self.cfg.get("hotkey_enabled"))
+        combo = self.cfg.get("hotkey", "")
+        self.dashboard.hotkey_btn.configure(
+            text="Disable hotkey" if on else "Enable hotkey")
+        self.dashboard.settings_label.configure(
+            text=f"Resumes {idle:g}s after you stop  ·  "
+                 + (f"Hotkey {combo}" if on else "Hotkey off"))
 
-    def _hotkey_fired(self):
-        # Runs on the pynput listener thread; marshal to UI.
-        QTimer.singleShot(0, self.toggle_typing)
+    def change_idle_resume(self) -> None:
+        from tkinter import simpledialog
+        cur = float(self.cfg.get("idle_resume_secs", 5.0))
+        val = simpledialog.askfloat(
+            "Pause delay",
+            "Resume typing after this many seconds of no mouse or keyboard "
+            "activity:", initialvalue=cur, minvalue=0.5, maxvalue=120.0,
+            parent=self.root)
+        if val is None:
+            return
+        self.cfg = config.update(idle_resume_secs=float(val))
+        self.engine.set_idle_resume_secs(float(val))
+        self._update_settings_label()
 
-    def change_hotkey(self):
-        dlg = HotkeyDialog(self.cfg["hotkey"], self)
-        if dlg.exec() == QDialog.Accepted:
-            self.cfg = config.update(hotkey=dlg.result_combo)
-            self._install_hotkey(dlg.result_combo)
+    def toggle_hotkey(self) -> None:
+        if self.cfg.get("hotkey_enabled"):
+            self.hotkeys.stop()
+            self.cfg = config.update(hotkey_enabled=False)
+            self._update_settings_label()
+            return
+        ok = messagebox.askyesno(
+            "Enable global hotkey",
+            f"Use {self.cfg.get('hotkey')} to start/stop typing from anywhere.\n\n"
+            "On macOS this needs Accessibility permission for this app "
+            "(System Settings → Privacy & Security → Accessibility). Without it "
+            "the hotkey won't work — the button always does.\n\nEnable it?",
+            parent=self.root)
+        if not ok:
+            return
+        self.cfg = config.update(hotkey_enabled=True)
+        self._install_hotkey(self.cfg["hotkey"])
+        self._update_settings_label()
 
-    def change_idle_resume(self):
-        current = float(self.cfg.get("idle_resume_secs", 5.0))
-        val, ok = QInputDialog.getDouble(
-            self, "Idle resume",
-            "Resume auto-typing after this many seconds of no mouse/keyboard "
-            "activity:",
-            current, 0.5, 120.0, 1,
-        )
-        if ok:
-            self.cfg = config.update(idle_resume_secs=float(val))
-            self.engine.set_idle_resume_secs(float(val))
-            self._update_hotkey_label()
-
-    # ── logout ─────────────────────────────────────────────────
-    def logout(self):
-        if self.engine.running:
-            self.engine.stop("Logged out.")
-        config.update(token="", email="")
-        QMessageBox.information(self, "Logged out", "You have been logged out. The app will close.")
-        self.close()
-
-    def closeEvent(self, event):
-        if self.engine.running:
-            self.engine.stop("App closing.")
-        self.hotkeys.stop()
-        super().closeEvent(event)
-
-
-# ── entrypoint ──────────────────────────────────────────────────
-def main():
-    app = QApplication(sys.argv)
-    app.setApplicationName("AutoTyper")
-
-    cfg = config.load()
-    log.info("AutoTyper starting. api_base=%s  have_token=%s",
-             cfg["api_base"], bool(cfg.get("token")))
-    api = ApiClient(cfg["api_base"], token=cfg.get("token", ""))
-
-    # If we have a token, verify it by fetching balance; else show login.
-    def ensure_logged_in() -> bool:
-        if not api.token:
-            return _do_login(api)
+    def _install_hotkey(self, combo: str) -> None:
+        log.info("starting global hotkey %r", combo)
         try:
-            api.balance()
-            return True
-        except ApiError:
-            return _do_login(api)
+            self.hotkeys.start(combo, lambda: self.tasks.post(self.toggle_typing))
+        except Exception:
+            log.exception("hotkey failed to start")
+            if self.dashboard:
+                self.dashboard.settings_label.configure(
+                    text="Hotkey couldn't start — grant Accessibility permission.",
+                    foreground=P.warning)
 
-    if not ensure_logged_in():
+    # ── lifecycle ──
+    def logout(self) -> None:
+        if self.engine.running:
+            self.engine.stop("Signed out.")
+        self.hotkeys.stop()
+        config.update(token="", email="")
+        self.api.token = ""
+        self.cfg = config.load()
+        self.show_auth()
+
+    def quit(self) -> None:
+        log.info("shutting down")
+        if self.engine.running:
+            self.engine.stop("Closing.")
+        self.hotkeys.stop()
+        self.tasks.stop()
+        self.root.destroy()
+
+    def start(self) -> int:
+        # Decide the first screen: verify a saved token, else show auth.
+        if self.api.token:
+            def verify():
+                self.api.balance()
+                return True
+            self.tasks.run(verify,
+                           on_done=lambda _ok: self.show_dashboard(),
+                           on_fail=lambda _m: self.show_auth(),
+                           name="verify-token")
+            # Placeholder while verifying.
+            splash = ttk.Frame(self.container, style="TFrame", padding=40)
+            ttk.Label(splash, text="AutoTyper", style="H1.TLabel").pack(pady=(60, 6))
+            ttk.Label(splash, text="Signing you in…", style="Dim.TLabel").pack()
+            self._swap(splash)
+        else:
+            self.show_auth()
+        self.root.mainloop()
         return 0
 
-    cfg = config.load()  # token may have been updated by login
-    api.token = cfg["token"]
-    log.debug("main: constructing MainWindow")
-    win = MainWindow(api, cfg)
-    log.debug("main: MainWindow constructed, showing")
-    win.show()
-    log.debug("main: entering event loop")
-    return app.exec()
 
-
-def _do_login(api: ApiClient) -> bool:
-    dlg = LoginDialog(api)
-    if dlg.exec() == QDialog.Accepted:
-        cfg = config.load()
-        api.token = cfg["token"]
-        return True
-    return False
+def main() -> int:
+    return AutoTyperApp().start()
 
 
 if __name__ == "__main__":
