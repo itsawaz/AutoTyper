@@ -503,6 +503,8 @@ class AutoTyperApp:
         self.peak_secs = 1.0          # for the meter scale
         self.session_id: str | None = None
         self._recharge: RechargeWindow | None = None
+        self._countdown_job: str | None = None
+        self._countdown_left = 0
 
         # Typing engine + hotkey
         self.engine = TyperEngine(
@@ -568,7 +570,10 @@ class AutoTyperApp:
     # ── typing ──
     def toggle_typing(self) -> None:
         if self.engine.running:
-            self.engine.stop("Stopping…")
+            self.engine.stop("Stopped.")
+            return
+        if self._countdown_job is not None:
+            self._cancel_countdown()
             return
         if self.balance_secs <= 0:
             messagebox.showinfo(
@@ -583,9 +588,43 @@ class AutoTyperApp:
                        on_fail=self._session_failed, name="session-start")
 
     def _session_started(self, res: dict) -> None:
+        """Session is open. Give the user a few seconds to focus the window they
+        want typed into, then minimise ourselves and start the engine.
+
+        Without this, keystrokes land in the AutoTyper window (it has focus after
+        you click Start) instead of the app you actually want typed into.
+        """
         self.session_id = res["session_id"]
         self.balance_secs = float(res["balance_secs"])
         self._balance_loaded({"balance_secs": self.balance_secs})
+        d = self.dashboard
+        d.toggle_btn.configure(text="Cancel", style="Stop.TButton", state="normal")
+        d.session_label.configure(text="Get ready", foreground=P.warning)
+        self._countdown_left = int(self.cfg.get("start_delay_secs", 5))
+        self._tick_countdown()
+
+    def _tick_countdown(self) -> None:
+        if self._countdown_job is not None:
+            self._countdown_job = None
+        if not self.dashboard or self.session_id is None:
+            return  # cancelled
+        if self._countdown_left <= 0:
+            self._begin_typing()
+            return
+        self.dashboard.status_label.configure(
+            text=f"Click the window you want typed into — starting in "
+                 f"{self._countdown_left}s. AutoTyper will minimise itself.",
+            foreground=P.warning)
+        self._countdown_left -= 1
+        self._countdown_job = self.root.after(1000, self._tick_countdown)
+
+    def _begin_typing(self) -> None:
+        """Minimise out of the way, then start emitting keystrokes."""
+        self._countdown_job = None
+        try:
+            self.root.iconify()   # so our window can't receive the keystrokes
+        except Exception:
+            pass
         self.engine.start()
         d = self.dashboard
         d.toggle_btn.configure(text="Stop typing", style="Stop.TButton",
@@ -593,7 +632,28 @@ class AutoTyperApp:
         d.session_label.configure(text="● Typing", foreground=P.success)
         d.status_label.configure(
             text="Typing. It pauses automatically when you use the mouse or "
-                 "keyboard.", foreground=P.text_dim)
+                 "keyboard, and resumes once you stop.", foreground=P.text_dim)
+
+    def _cancel_countdown(self) -> None:
+        """User pressed Cancel during the get-ready countdown."""
+        if self._countdown_job is not None:
+            try:
+                self.root.after_cancel(self._countdown_job)
+            except Exception:
+                pass
+            self._countdown_job = None
+        self._countdown_left = 0
+        sid, self.session_id = self.session_id, None
+        if self.dashboard:
+            d = self.dashboard
+            d.toggle_btn.configure(text="Start typing", style="Accent.TButton",
+                                   state="normal")
+            d.session_label.configure(text="Idle", foreground=P.text_dim)
+            d.status_label.configure(text="Cancelled.", foreground=P.text_dim)
+        if sid:
+            self.tasks.run(lambda: self.api.stop_session(sid, 0.0),
+                           on_done=lambda _r: self.refresh_balance(),
+                           on_fail=lambda _m: None, name="session-cancel")
 
     def _session_failed(self, msg: str) -> None:
         d = self.dashboard
@@ -634,6 +694,12 @@ class AutoTyperApp:
 
     def _on_engine_stopped(self, reason: str) -> None:
         sid, self.session_id = self.session_id, None
+        # Bring the window back so the user can see the result / restart.
+        try:
+            self.root.deiconify()
+            self.root.lift()
+        except Exception:
+            pass
         if self.dashboard:
             d = self.dashboard
             d.toggle_btn.configure(text="Start typing", style="Accent.TButton",
@@ -667,8 +733,10 @@ class AutoTyperApp:
             self.dashboard.hotkey_btn.configure(
                 text="Disable hotkey" if on else "Enable hotkey")
             hk = f"Hotkey {combo}" if on else "Hotkey off"
+        delay = int(self.cfg.get("start_delay_secs", 5))
         self.dashboard.settings_label.configure(
-            text=f"Resumes {idle:g}s after you stop  ·  {hk}")
+            text=f"{delay}s to switch windows  ·  resumes {idle:g}s after you "
+                 f"stop  ·  {hk}")
 
     def change_idle_resume(self) -> None:
         from tkinter import simpledialog

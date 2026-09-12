@@ -25,6 +25,9 @@ DEFAULTS = {
     # Global hotkey is OFF by default: pynput's macOS listener hard-crashes
     # (SIGTRAP) without Accessibility permission. The user opts in explicitly.
     "hotkey_enabled": False,
+    # Seconds to wait after pressing Start so you can click into the window you
+    # want typed into. AutoTyper minimises itself before it begins typing.
+    "start_delay_secs": 5,
     "token": "",                    # JWT for the logged-in user
     "email": "",
     # Seconds of no user activity before auto-typing resumes after the user
