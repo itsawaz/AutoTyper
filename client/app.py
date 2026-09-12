@@ -20,6 +20,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import config
+import permissions
 import ui_kit as ui
 from api_client import ApiClient, ApiError
 from async_task import TaskRunner
@@ -517,6 +518,9 @@ class AutoTyperApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self.quit)
         log.info("AutoTyper starting. api_base=%s", self.cfg["api_base"])
+        log.info("platform=%s frozen=%s accessibility_trusted=%s",
+                 sys.platform, getattr(sys, "frozen", False),
+                 permissions.accessibility_trusted())
 
     # ── screen switching ──
     def _swap(self, screen: ttk.Frame) -> None:
@@ -580,6 +584,25 @@ class AutoTyperApp:
                 APP_TITLE, "You have no hours left. Add hours to continue.",
                 parent=self.root)
             self.open_recharge()
+            return
+
+        # macOS silently discards simulated keystrokes unless the app is trusted
+        # for Accessibility, so check before pretending to type.
+        trusted = permissions.accessibility_trusted()
+        log.info("accessibility trusted = %s", trusted)
+        if trusted is False:
+            who = permissions.host_app_hint()
+            if messagebox.askyesno(
+                "Accessibility permission needed",
+                "macOS won't let AutoTyper send keystrokes until you allow it.\n\n"
+                f"Turn ON: {who}\n"
+                "in System Settings → Privacy & Security → Accessibility, then "
+                "come back and press Start typing again.\n\n"
+                "Open those settings now?",
+                parent=self.root,
+            ):
+                permissions.request_accessibility()
+                permissions.open_accessibility_settings()
             return
         self.dashboard.toggle_btn.configure(state="disabled")
         self.dashboard.status_label.configure(text="Starting session…",

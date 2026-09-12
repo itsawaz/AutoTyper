@@ -12,6 +12,7 @@ The actual keystroke simulation (dwell times, typos, auto-breaks) is preserved.
 """
 from __future__ import annotations
 
+import logging
 import random
 import sys
 import threading
@@ -101,6 +102,9 @@ _SHIFT_CHARS = {
     **{c: c.lower() for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"},
     '(': '9', ')': '0', '*': '8', '_': '-', ':': ';', '"': "'",
 }
+
+
+log = logging.getLogger("autotyper.engine")
 
 
 def _type_char(char: str, mark_synthetic: Callable[[], None] | None = None) -> None:
@@ -380,6 +384,7 @@ class TyperEngine:
                 index = 0
             cmd = pool[index]
             index += 1
+            log.info("typing command: %s", cmd)
 
             for ch in cmd:
                 if not self._running:
