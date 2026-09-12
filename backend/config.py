@@ -32,9 +32,9 @@ class Settings(BaseSettings):
     gmail_client_id: str = ""
     gmail_client_secret: str = ""
     gmail_refresh_token: str = ""
-    # Only read emails under this Gmail label (set a filter to apply it to bank
-    # alerts). Leave blank to search the inbox with a query instead.
-    gmail_label: str = "upi-alerts"
+    # Optional Gmail label to restrict reads to. Blank (default) = query by the
+    # trusted sender (UPI_ALERT_SENDER) instead, so no Gmail filter is needed.
+    gmail_label: str = ""
     # Which bank/wallet parser to use for the alert format.
     upi_bank_parser: str = "hdfc"
     # Only trust alerts from this sender (defends against spoofed emails matching

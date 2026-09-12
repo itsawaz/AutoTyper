@@ -128,10 +128,13 @@ def fetch_recent_alerts() -> list[CreditAlert]:
     settings = get_settings()
     token = refresh_access_token()
 
-    # Restrict to the alert label if configured, and to recent mail only.
-    parts = ["newer_than:1d"]
+    # Restrict to recent mail, and to either the alert label (if set) or the
+    # trusted sender. Querying by sender means no Gmail filter/label is required.
+    parts = ["newer_than:2d"]
     if settings.gmail_label:
-        parts.append(f'label:{settings.gmail_label}')
+        parts.append(f"label:{settings.gmail_label}")
+    elif settings.upi_alert_sender:
+        parts.append(f"from:{settings.upi_alert_sender}")
     query = " ".join(parts)
 
     parser = PARSERS.get(settings.upi_bank_parser, parse_generic)
