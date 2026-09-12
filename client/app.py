@@ -35,26 +35,39 @@ def _fmt_hms(secs: float) -> str:
     return f"{s}s"
 
 
-def _make_qr_pixmap(data: str, size: int = 240):
-    """Render `data` (a upi:// link) to a QPixmap QR code. Returns None if the
-    qrcode library isn't available."""
+def _make_qr_pixmap(data: str, target: int = 280):
+    """Render `data` (a upi:// link) to a crisp, scannable QPixmap QR code.
+
+    Key correctness points for scannability:
+      - a wide quiet zone (border=4 modules, the QR spec minimum),
+      - integer scaling so module edges stay sharp (no blur),
+      - high error correction so phone cameras lock on more easily.
+    Returns None if the qrcode library isn't available.
+    """
     try:
         import qrcode
+        from qrcode.constants import ERROR_CORRECT_M
     except Exception:
         return None
-    qr = qrcode.QRCode(border=2, box_size=8)
+    qr = qrcode.QRCode(error_correction=ERROR_CORRECT_M, border=4, box_size=1)
     qr.add_data(data)
     qr.make(fit=True)
     matrix = qr.get_matrix()
-    n = len(matrix)
-    img = QImage(n, n, QImage.Format_RGB32)
+    n = len(matrix)  # includes the border quiet zone
+
+    # Base 1px-per-module image, then scale up by an integer factor so every
+    # module is an exact block of pixels (sharp edges = reliably scannable).
+    base = QImage(n, n, QImage.Format_RGB32)
     black = 0xFF000000
     white = 0xFFFFFFFF
     for y in range(n):
         for x in range(n):
-            img.setPixel(x, y, black if matrix[y][x] else white)
-    return QPixmap.fromImage(img).scaled(size, size, Qt.KeepAspectRatio,
-                                         Qt.FastTransformation)
+            base.setPixel(x, y, black if matrix[y][x] else white)
+
+    scale = max(1, target // n)
+    px = QPixmap.fromImage(base)
+    return px.scaled(n * scale, n * scale, Qt.KeepAspectRatio,
+                     Qt.FastTransformation)
 
 
 # ── background worker for one-off API calls ────────────────────
@@ -76,25 +89,42 @@ class Worker(QObject):
 
 
 def run_async(parent, fn, on_done=None, on_fail=None):
-    """Run `fn` on a QThread; deliver result on the UI thread."""
+    """Run `fn` on a QThread; deliver the result on the UI thread.
+
+    Cleanup is driven by QThread.finished (never by calling thread.wait() from a
+    slot, which blocks the UI thread and can deadlock inside a modal exec loop).
+    Thread/worker refs are held on `parent` until the thread finishes, then
+    released, so nothing is garbage-collected mid-run.
+    """
     thread = QThread(parent)
     worker = Worker(fn)
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
 
-    def _cleanup():
-        thread.quit()
-        thread.wait()
-
     if on_done:
         worker.done.connect(on_done)
     if on_fail:
         worker.failed.connect(on_fail)
-    worker.done.connect(lambda *_: _cleanup())
-    worker.failed.connect(lambda *_: _cleanup())
-    # Keep refs alive.
+
+    # When the work finishes (either signal), ask the thread's event loop to
+    # quit. This does NOT block the UI thread.
+    worker.done.connect(lambda *_: thread.quit())
+    worker.failed.connect(lambda *_: thread.quit())
+
+    # Keep strong refs so neither is collected while running.
     parent._threads = getattr(parent, "_threads", [])
-    parent._threads.append((thread, worker))
+    entry = (thread, worker)
+    parent._threads.append(entry)
+
+    def _released():
+        worker.deleteLater()
+        try:
+            parent._threads.remove(entry)
+        except ValueError:
+            pass
+
+    thread.finished.connect(_released)
+    thread.finished.connect(thread.deleteLater)
     thread.start()
 
 
@@ -189,9 +219,6 @@ class RechargeDialog(QDialog):
         self.amount_label = QLabel()
         self.amount_label.setAlignment(Qt.AlignCenter)
         self.amount_label.setStyleSheet("font-size:16px; font-weight:600")
-        self.open_app_btn = QPushButton("Open in a UPI app")
-        self.open_app_btn.clicked.connect(self._open_upi_app)
-        self.open_app_btn.setVisible(False)
 
         self.status = QLabel("Choose how many hours to add, then pay by UPI.")
         self.status.setWordWrap(True)
@@ -205,7 +232,6 @@ class RechargeDialog(QDialog):
         layout.addWidget(self.buy_btn)
         layout.addWidget(self.amount_label)
         layout.addWidget(self.qr_label)
-        layout.addWidget(self.open_app_btn)
         layout.addWidget(self.status)
 
         # On-demand confirmation polling while the user pays.
@@ -230,17 +256,18 @@ class RechargeDialog(QDialog):
         self._upi_uri = order.get("upi_uri", "")
 
         if self._upi_uri:
-            # UPI flow: show a QR of the exact-amount upi:// link + a button.
+            # UPI flow: show a QR of the exact-amount upi:// link to scan with
+            # a phone (payment happens on the phone, not this computer).
             self.amount_label.setText(f"Pay exactly ₹{amount:.2f}")
             pix = _make_qr_pixmap(self._upi_uri)
             if pix is not None:
                 self.qr_label.setPixmap(pix)
                 self.qr_label.setVisible(True)
-            self.open_app_btn.setVisible(True)
             self.status.setText(
-                "Scan the QR with any UPI app, or tap ‘Open in a UPI app’. "
-                "Pay the exact amount shown — it identifies your payment. "
-                "Your hours are added automatically once the payment lands."
+                "Open any UPI app on your phone (GPay / PhonePe / Paytm), scan "
+                "this QR, and pay the exact amount shown — the amount identifies "
+                "your payment. Keep this window open; your hours are added "
+                "automatically within a minute of paying."
             )
         else:
             # Mock/other flow: open the returned pay page in a browser.
@@ -251,11 +278,6 @@ class RechargeDialog(QDialog):
                 "here — your hours are added automatically."
             )
         self._poll.start()
-
-    def _open_upi_app(self):
-        if self._upi_uri:
-            # Opens the upi:// deep link in the OS-registered UPI handler.
-            webbrowser.open(self._upi_uri)
 
     def _check_status(self):
         if not self._order_id:
