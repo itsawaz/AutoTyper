@@ -28,6 +28,9 @@ DEFAULTS = {
     # Seconds to wait after pressing Start so you can click into the window you
     # want typed into. AutoTyper minimises itself before it begins typing.
     "start_delay_secs": 5,
+    # Set once the user has acknowledged the macOS Accessibility notice, so we
+    # stop asking (the system trust check is unreliable for unsigned apps).
+    "accessibility_ack": False,
     "token": "",                    # JWT for the logged-in user
     "email": "",
     # Seconds of no user activity before auto-typing resumes after the user

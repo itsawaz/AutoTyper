@@ -415,6 +415,76 @@ class RechargeWindow(tk.Toplevel):
 
 
 # ────────────────────────────────────────────────────────────────
+# Accessibility notice
+# ────────────────────────────────────────────────────────────────
+class AccessibilityDialog(tk.Toplevel):
+    """Advisory notice about macOS Accessibility permission.
+
+    Deliberately not a hard gate: the system trust check can report False even
+    when typing works (unsigned app, or permission granted after launch), so the
+    user can always choose "Start anyway" and can silence the notice.
+    """
+
+    def __init__(self, app: "AutoTyperApp"):
+        super().__init__(app.root)
+        self.app = app
+        self._choice = "cancel"
+        self.title("Allow keyboard control")
+        self.configure(bg=P.bg)
+        self.resizable(False, False)
+        self.transient(app.root)
+        self.grab_set()
+
+        who = permissions.host_app_hint()
+        wrap = ttk.Frame(self, style="TFrame", padding=(24, 20))
+        wrap.pack(fill="both", expand=True)
+
+        ttk.Label(wrap, text="Allow keyboard control",
+                  style="H1.TLabel").pack(anchor="w")
+        ttk.Label(
+            wrap,
+            text=("macOS needs to let AutoTyper send keystrokes. If nothing gets "
+                  "typed, enable it here:\n\n"
+                  "System Settings → Privacy & Security → Accessibility\n"
+                  f"→ turn ON {who}\n\n"
+                  "Already enabled it? macOS only applies this after a restart — "
+                  "quit and reopen AutoTyper. You can also just start anyway."),
+            style="Dim.TLabel", wraplength=400, justify="left",
+        ).pack(anchor="w", pady=(8, 16))
+
+        self.remember = tk.BooleanVar(value=False)
+        cb = tk.Checkbutton(
+            wrap, text="Don't show this again", variable=self.remember,
+            bg=P.bg, fg=P.text_dim, selectcolor=P.surface_alt,
+            activebackground=P.bg, activeforeground=P.text,
+            highlightthickness=0, borderwidth=0,
+        )
+        cb.pack(anchor="w", pady=(0, 14))
+
+        row = ttk.Frame(wrap, style="TFrame")
+        row.pack(fill="x")
+        ttk.Button(row, text="Open Settings", style="Accent.TButton",
+                   command=lambda: self._pick("settings")).pack(side="left")
+        ttk.Button(row, text="Start anyway", style="Ghost.TButton",
+                   command=lambda: self._pick("anyway")).pack(side="left",
+                                                              padx=(8, 0))
+        ttk.Button(row, text="Cancel", style="Ghost.TButton",
+                   command=lambda: self._pick("cancel")).pack(side="right")
+
+        ui.center_window(self, 460, 330)
+        self.protocol("WM_DELETE_WINDOW", lambda: self._pick("cancel"))
+
+    def _pick(self, choice: str) -> None:
+        self._choice = choice
+        self.destroy()
+
+    def ask(self) -> tuple[str, bool]:
+        """Show modally; return (choice, remember)."""
+        self.wait_window()
+        return self._choice, bool(self.remember.get())
+
+
+# ────────────────────────────────────────────────────────────────
 # Dashboard
 # ────────────────────────────────────────────────────────────────
 class DashboardScreen(ttk.Frame):
@@ -586,24 +656,23 @@ class AutoTyperApp:
             self.open_recharge()
             return
 
-        # macOS silently discards simulated keystrokes unless the app is trusted
-        # for Accessibility, so check before pretending to type.
+        # macOS discards simulated keystrokes unless the app is trusted for
+        # Accessibility. The system check is unreliable for unsigned apps (and is
+        # cached per process, so it stays False until a restart), so we only
+        # *advise* — never block — and let the user dismiss it for good.
         trusted = permissions.accessibility_trusted()
         log.info("accessibility trusted = %s", trusted)
-        if trusted is False:
-            who = permissions.host_app_hint()
-            if messagebox.askyesno(
-                "Accessibility permission needed",
-                "macOS won't let AutoTyper send keystrokes until you allow it.\n\n"
-                f"Turn ON: {who}\n"
-                "in System Settings → Privacy & Security → Accessibility, then "
-                "come back and press Start typing again.\n\n"
-                "Open those settings now?",
-                parent=self.root,
-            ):
+        if trusted is False and not self.cfg.get("accessibility_ack"):
+            choice, remember = AccessibilityDialog(self).ask()
+            if remember:
+                self.cfg = config.update(accessibility_ack=True)
+            if choice == "settings":
                 permissions.request_accessibility()
                 permissions.open_accessibility_settings()
-            return
+                return
+            if choice == "cancel":
+                return
+            # "anyway" → fall through and start typing.
         self.dashboard.toggle_btn.configure(state="disabled")
         self.dashboard.status_label.configure(text="Starting session…",
                                               foreground=P.text_dim)
