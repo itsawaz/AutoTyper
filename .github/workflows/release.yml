@@ -1,0 +1,108 @@
+name: Release desktop apps
+
+# Builds the standalone AutoTyper client for macOS and Windows and attaches the
+# zipped apps to a GitHub Release, giving stable public download links.
+#
+# Trigger: push a tag like v1.0.0
+#   git tag v1.0.0 && git push origin v1.0.0
+# Or run manually via "Run workflow" (creates/updates a release for the given tag).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to create (e.g. v1.0.0)"
+        required: true
+        default: "v0.0.0-test"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            asset: AutoTyper-macos
+          - os: windows-latest
+            asset: AutoTyper-windows
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        working-directory: client
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build with PyInstaller
+        working-directory: client
+        run: pyinstaller autotyper.spec --noconfirm
+
+      - name: Package (zip) the app
+        working-directory: client/dist
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            ditto -c -k --sequesterRsrc --keepParent AutoTyper.app "${{ matrix.asset }}.zip"
+          else
+            7z a "${{ matrix.asset }}.zip" AutoTyper
+          fi
+          ls -la
+
+      - name: Upload build artifact (for the release job)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: client/dist/${{ matrix.asset }}.zip
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Resolve tag name
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: AutoTyper ${{ steps.tag.outputs.tag }}
+          body: |
+            AutoTyper desktop app.
+
+            Downloads:
+            - macOS: `AutoTyper-macos.zip` (unzip → AutoTyper.app). First launch:
+              right-click → Open (unsigned app), then grant Accessibility
+              permission in System Settings → Privacy & Security → Accessibility.
+            - Windows: `AutoTyper-windows.zip` (unzip → AutoTyper/AutoTyper.exe).
+
+            The app talks to the hosted backend and confirms UPI top-ups
+            automatically.
+          files: artifacts/**/*.zip
+          fail_on_unmatched_files: true
