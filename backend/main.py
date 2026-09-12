@@ -121,10 +121,90 @@ class OrderStatusOut(BaseModel):
     status: str
 
 
-# ── health ─────────────────────────────────────────────────────
-@app.get("/")
+# ── health / public pages ──────────────────────────────────────
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <!doctype html><html lang="en"><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AutoTyper</title></head>
+    <body style="font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.6;color:#222">
+      <h1>AutoTyper</h1>
+      <p>AutoTyper is a desktop application that simulates human-like typing
+         activity. Usage is sold by the hour; users log in, top up their balance
+         by UPI, and the app runs while they have time remaining.</p>
+      <p>This site hosts the AutoTyper backend service (accounts, balance, and
+         payment confirmation) for the desktop app. It is not a consumer website.</p>
+      <ul>
+        <li><a href="/privacy">Privacy Policy</a></li>
+      </ul>
+      <p style="color:#888">Contact: helloneerajkumarsingh@gmail.com</p>
+    </body></html>
+    """
+
+
+@app.get("/healthz")
 def health():
     return {"ok": True, "service": "autotyper-api"}
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy():
+    return """
+    <!doctype html><html lang="en"><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AutoTyper — Privacy Policy</title></head>
+    <body style="font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 20px;line-height:1.6;color:#222">
+      <h1>Privacy Policy</h1>
+      <p><em>Last updated: September 2026</em></p>
+
+      <h2>Who we are</h2>
+      <p>AutoTyper ("we", "the app") is a desktop application and its supporting
+         backend service. Contact: helloneerajkumarsingh@gmail.com.</p>
+
+      <h2>Information we collect</h2>
+      <ul>
+        <li><strong>Account data:</strong> the email address and password
+            (stored only as a secure hash) you use to sign in.</li>
+        <li><strong>Usage data:</strong> the amount of active time you consume,
+            used to deduct from your paid balance.</li>
+        <li><strong>Payment records:</strong> order amounts and the bank
+            reference number of a completed UPI payment, used to confirm and
+            credit your purchase.</li>
+      </ul>
+
+      <h2>How we use Google / Gmail data</h2>
+      <p>To confirm UPI payments automatically, the service reads the account
+         owner's own bank payment-alert emails using read-only Gmail API access
+         (<code>gmail.readonly</code>). We only read messages from the
+         configured bank sender to extract the payment amount and reference
+         number. We do not read, store, or share the contents of any other
+         email. Google user data is used solely to confirm payments and is not
+         transferred to third parties, used for advertising, or used for any
+         other purpose. Our use of information received from Google APIs adheres
+         to the Google API Services User Data Policy, including the Limited Use
+         requirements.</p>
+
+      <h2>Data sharing</h2>
+      <p>We do not sell or share your personal data with third parties. Data is
+         stored in our database provider (Turso) solely to operate the service.</p>
+
+      <h2>Data retention</h2>
+      <p>Account, usage, and payment records are retained for as long as your
+         account is active or as needed for reconciliation and legal
+         obligations. You can request deletion by emailing us.</p>
+
+      <h2>Your choices</h2>
+      <p>You may request access to or deletion of your data at any time by
+         contacting helloneerajkumarsingh@gmail.com. You can revoke the app's
+         Gmail access at any time at
+         <a href="https://myaccount.google.com/permissions">Google Account
+         permissions</a>.</p>
+
+      <h2>Contact</h2>
+      <p>Questions about this policy: helloneerajkumarsingh@gmail.com</p>
+    </body></html>
+    """
 
 
 # ── auth ───────────────────────────────────────────────────────
