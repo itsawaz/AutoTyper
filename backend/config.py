@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     # Optional Gmail label to restrict reads to. Blank (default) = query by the
     # trusted sender (UPI_ALERT_SENDER) instead, so no Gmail filter is needed.
     gmail_label: str = ""
+    # How many days back to scan for alerts. Kept small so we only match recent
+    # payments; a paid order's TTL is much shorter anyway.
+    gmail_lookback_days: int = 3
     # Which bank/wallet parser to use for the alert format.
     upi_bank_parser: str = "hdfc"
     # Only trust alerts from this sender (defends against spoofed emails matching

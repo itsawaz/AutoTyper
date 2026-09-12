@@ -130,7 +130,7 @@ def fetch_recent_alerts() -> list[CreditAlert]:
 
     # Restrict to recent mail, and to either the alert label (if set) or the
     # trusted sender. Querying by sender means no Gmail filter/label is required.
-    parts = ["newer_than:2d"]
+    parts = [f"newer_than:{settings.gmail_lookback_days}d"]
     if settings.gmail_label:
         parts.append(f"label:{settings.gmail_label}")
     elif settings.upi_alert_sender:
