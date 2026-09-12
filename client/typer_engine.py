@@ -13,14 +13,52 @@ The actual keystroke simulation (dwell times, typos, auto-breaks) is preserved.
 from __future__ import annotations
 
 import random
+import sys
 import threading
 import time
 from typing import Callable
 
 import pyautogui
-from pynput import keyboard as _kb, mouse as _ms
 
 pyautogui.FAILSAFE = False
+
+
+# ── user-activity detection (polling, no event taps) ───────────
+# We deliberately do NOT use pynput listeners here. On macOS a global event tap
+# started from inside a GUI app conflicts with the toolkit's main run loop and
+# aborts the whole process (SIGTRAP) — which can't be caught in Python. Polling
+# uses only read-only APIs, needs no special permission, and cannot crash.
+def _hid_idle_seconds():
+    """Seconds since the last real user input, or None if unavailable.
+
+    macOS   : CGEventSourceSecondsSinceLastEventType (HID = physical devices)
+    Windows : GetLastInputInfo
+    """
+    if sys.platform == "darwin":
+        try:
+            from Quartz import (CGEventSourceSecondsSinceLastEventType,
+                                kCGEventSourceStateHIDSystemState,
+                                kCGAnyInputEventType)
+            return float(CGEventSourceSecondsSinceLastEventType(
+                kCGEventSourceStateHIDSystemState, kCGAnyInputEventType))
+        except Exception:
+            return None
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            class _LASTINPUTINFO(ctypes.Structure):
+                _fields_ = [("cbSize", ctypes.c_uint),
+                            ("dwTime", ctypes.c_uint)]
+
+            info = _LASTINPUTINFO()
+            info.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+            if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+                millis = ctypes.windll.kernel32.GetTickCount() - info.dwTime
+                return millis / 1000.0
+        except Exception:
+            return None
+    return None
 
 # Break configuration (seconds): 15-20 min typing, then 2-5 min break.
 MIN_TYPING_BEFORE_BREAK = 15 * 60
@@ -35,10 +73,13 @@ HEARTBEAT_INTERVAL = 20.0
 # auto-typer and resume after this many seconds of no user activity.
 DEFAULT_IDLE_RESUME_SECS = 5.0
 
-# When the engine sends a synthetic keystroke, keyboard events observed within
-# this many seconds are assumed to be our own and are ignored by the activity
-# monitor (so the engine doesn't detect itself and pause forever).
-_SYNTHETIC_GUARD_SECS = 0.35
+# When the engine sends a synthetic keystroke, input observed within this many
+# seconds is assumed to be our own and is ignored by the activity monitor (so the
+# engine doesn't detect itself and pause forever).
+_SYNTHETIC_GUARD_SECS = 0.6
+
+# How often the activity monitor polls for user input.
+ACTIVITY_POLL_INTERVAL = 0.2
 
 RPGLE_CL_COMMANDS = [
     "CRTBNDRPG PGM(MYPGM) SRCFILE(QRPGLESRC)",
@@ -134,8 +175,7 @@ class TyperEngine:
         # input and ignored by the monitor.
         self._synthetic_until = 0.0
         self._user_paused = False
-        self._mouse_listener: _ms.Listener | None = None
-        self._kbd_listener: _kb.Listener | None = None
+        self._monitor_thread: threading.Thread | None = None
 
     # ── public API ─────────────────────────────────────────────
     @property
@@ -203,41 +243,47 @@ class TyperEngine:
         activity monitor ignores our own synthetic keyboard events."""
         self._synthetic_until = time.time() + _SYNTHETIC_GUARD_SECS
 
-    def _note_user_activity(self, from_keyboard: bool) -> None:
-        """Record real user input. Keyboard events inside the synthetic guard
-        window are ignored (they're our own). Mouse movement is always real
-        because the engine never moves the mouse."""
-        if from_keyboard and time.time() < self._synthetic_until:
-            return
-        self._last_user_activity = time.time()
-
     def _start_activity_monitor(self) -> None:
-        try:
-            self._mouse_listener = _ms.Listener(
-                on_move=lambda x, y: self._note_user_activity(False),
-                on_click=lambda x, y, b, p: self._note_user_activity(False),
-                on_scroll=lambda x, y, dx, dy: self._note_user_activity(False),
-            )
-            self._mouse_listener.start()
-            self._kbd_listener = _kb.Listener(
-                on_press=lambda k: self._note_user_activity(True),
-            )
-            self._kbd_listener.start()
-        except Exception:
-            # If listeners can't start (e.g. no accessibility permission), the
-            # engine still works — it just won't auto-pause on user activity.
-            self._mouse_listener = None
-            self._kbd_listener = None
+        """Start the polling watcher thread (no event taps — see module notes)."""
+        self._monitor_thread = threading.Thread(
+            target=self._activity_poll_loop, daemon=True, name="activity-monitor")
+        self._monitor_thread.start()
 
     def _stop_activity_monitor(self) -> None:
-        for lst in (self._mouse_listener, self._kbd_listener):
-            if lst is not None:
-                try:
-                    lst.stop()
-                except Exception:
-                    pass
-        self._mouse_listener = None
-        self._kbd_listener = None
+        # The loop exits on its own when self._running goes False.
+        self._monitor_thread = None
+
+    def _activity_poll_loop(self) -> None:
+        """Detect real user input by polling, every ACTIVITY_POLL_INTERVAL.
+
+        Two independent signals:
+          1. Mouse movement — the engine never moves the mouse, so any change in
+             the cursor position is unambiguously the user.
+          2. System idle time — resets on any input including our own synthetic
+             keystrokes, so we only trust it outside the synthetic guard window.
+        """
+        last_pos = None
+        while self._running:
+            time.sleep(ACTIVITY_POLL_INTERVAL)
+            if not self._running:
+                break
+
+            # 1) mouse movement
+            try:
+                pos = pyautogui.position()
+            except Exception:
+                pos = None
+            if pos is not None and last_pos is not None and pos != last_pos:
+                self._last_user_activity = time.time()
+            if pos is not None:
+                last_pos = pos
+
+            # 2) keyboard / clicks via system idle time, ignoring our own output
+            idle = _hid_idle_seconds()
+            if (idle is not None
+                    and idle < ACTIVITY_POLL_INTERVAL * 2
+                    and time.time() >= self._synthetic_until):
+                self._last_user_activity = time.time()
 
     def _user_is_active(self) -> bool:
         if self._last_user_activity <= 0:

@@ -536,8 +536,8 @@ class AutoTyperApp:
         self.dashboard.email_label.configure(text=self.cfg.get("email", ""))
         self._update_settings_label()
         self.refresh_balance()
-        # Start the hotkey only if the user previously enabled it.
-        if self.cfg.get("hotkey_enabled"):
+        # Start the hotkey only if enabled AND the platform supports it safely.
+        if self.cfg.get("hotkey_enabled") and sys.platform != "darwin":
             self.root.after(400, lambda: self._install_hotkey(self.cfg["hotkey"]))
 
     # ── balance ──
@@ -658,13 +658,17 @@ class AutoTyperApp:
         if not self.dashboard:
             return
         idle = float(self.cfg.get("idle_resume_secs", 5.0))
-        on = bool(self.cfg.get("hotkey_enabled"))
+        on = bool(self.cfg.get("hotkey_enabled")) and sys.platform != "darwin"
         combo = self.cfg.get("hotkey", "")
-        self.dashboard.hotkey_btn.configure(
-            text="Disable hotkey" if on else "Enable hotkey")
+        if sys.platform == "darwin":
+            self.dashboard.hotkey_btn.configure(text="About hotkey")
+            hk = "Hotkey n/a on macOS"
+        else:
+            self.dashboard.hotkey_btn.configure(
+                text="Disable hotkey" if on else "Enable hotkey")
+            hk = f"Hotkey {combo}" if on else "Hotkey off"
         self.dashboard.settings_label.configure(
-            text=f"Resumes {idle:g}s after you stop  ·  "
-                 + (f"Hotkey {combo}" if on else "Hotkey off"))
+            text=f"Resumes {idle:g}s after you stop  ·  {hk}")
 
     def change_idle_resume(self) -> None:
         from tkinter import simpledialog
@@ -681,19 +685,24 @@ class AutoTyperApp:
         self._update_settings_label()
 
     def toggle_hotkey(self) -> None:
+        # macOS: a global event tap (pynput) started inside a GUI app fights the
+        # toolkit's main run loop and aborts the process at the native level, so
+        # we don't offer it here rather than ship a button that can kill the app.
+        if sys.platform == "darwin":
+            messagebox.showinfo(
+                "Global hotkey unavailable on macOS",
+                "System-wide hotkeys aren't supported in this build on macOS — "
+                "the OS keyboard hook conflicts with the app's window system and "
+                "would close the app.\n\n"
+                "Use the Start/Stop button instead. Typing still pauses "
+                "automatically whenever you use the mouse or keyboard.",
+                parent=self.root)
+            return
+
         if self.cfg.get("hotkey_enabled"):
             self.hotkeys.stop()
             self.cfg = config.update(hotkey_enabled=False)
             self._update_settings_label()
-            return
-        ok = messagebox.askyesno(
-            "Enable global hotkey",
-            f"Use {self.cfg.get('hotkey')} to start/stop typing from anywhere.\n\n"
-            "On macOS this needs Accessibility permission for this app "
-            "(System Settings → Privacy & Security → Accessibility). Without it "
-            "the hotkey won't work — the button always does.\n\nEnable it?",
-            parent=self.root)
-        if not ok:
             return
         self.cfg = config.update(hotkey_enabled=True)
         self._install_hotkey(self.cfg["hotkey"])
