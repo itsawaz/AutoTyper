@@ -27,9 +27,9 @@ orders
     hours         REAL NOT NULL            -- hours purchased
     amount_paise  INTEGER NOT NULL
     currency      TEXT NOT NULL
-    status        TEXT NOT NULL            -- 'created' | 'paid' | 'failed'
-    provider      TEXT NOT NULL            -- 'mock' | 'juspay'
-    provider_ref  TEXT                     -- gateway order/txn id
+    status        TEXT NOT NULL            -- 'created' | 'paid' | 'expired'
+    provider      TEXT NOT NULL            -- 'upi_gmail' | 'mock'
+    provider_ref  TEXT                     -- provider order ref
     created_at    TEXT NOT NULL
     paid_at       TEXT
 """
@@ -70,9 +70,30 @@ _SCHEMA = [
         provider      TEXT NOT NULL,
         provider_ref  TEXT,
         created_at    TEXT NOT NULL,
-        paid_at       TEXT
+        paid_at       TEXT,
+        expires_at    TEXT,          -- UPI: when a pending order stops matching
+        matched_ref   TEXT           -- UPI: bank ref/UTR that paid this order
     )
     """,
+    # Idempotency guard: a bank alert (unique amount) can match only one order.
+    "CREATE INDEX IF NOT EXISTS idx_orders_amount_status ON orders(amount_paise, status)",
+    """
+    CREATE TABLE IF NOT EXISTS payment_events (
+        id            TEXT PRIMARY KEY,      -- uuid4
+        created_at    TEXT NOT NULL,
+        source        TEXT NOT NULL,         -- 'gmail_poll' | 'gmail_check' | 'upi_gmail' | 'mock'
+        outcome       TEXT NOT NULL,         -- 'matched' | 'unmatched' | 'duplicate' | 'error'
+        amount_paise  INTEGER,               -- amount seen in the alert
+        bank_ref      TEXT,                  -- UPI reference / UTR
+        order_id      TEXT,                  -- order it matched (if any)
+        user_id       TEXT,                  -- owner of the matched order (if any)
+        subject       TEXT,                  -- email subject (audit)
+        snippet       TEXT,                  -- email snippet (audit)
+        detail        TEXT                   -- freeform note / error text
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_events_ref ON payment_events(bank_ref)",
+    "CREATE INDEX IF NOT EXISTS idx_events_created ON payment_events(created_at)",
 ]
 
 
@@ -91,11 +112,30 @@ def _client() -> libsql_client.Client:
     )
 
 
+# Columns added after the first release; applied idempotently on init.
+_MIGRATIONS = [
+    ("orders", "expires_at", "ALTER TABLE orders ADD COLUMN expires_at TEXT"),
+    ("orders", "matched_ref", "ALTER TABLE orders ADD COLUMN matched_ref TEXT"),
+]
+
+
 def init_db() -> None:
-    """Create tables if they don't exist. Safe to call on every cold start."""
+    """Create tables if they don't exist and apply column migrations. Safe to
+    call on every cold start."""
     with _client() as client:
         for stmt in _SCHEMA:
             client.execute(stmt)
+        # Add columns that may be missing on an already-created DB.
+        for table, column, alter_sql in _MIGRATIONS:
+            if not _column_exists(client, table, column):
+                client.execute(alter_sql)
+
+
+def _column_exists(client, table: str, column: str) -> bool:
+    rs = client.execute(f"PRAGMA table_info({table})")
+    # PRAGMA table_info columns: cid, name, type, notnull, dflt_value, pk
+    names = {row[1] for row in rs.rows}
+    return column in names
 
 
 def execute(sql: str, params: tuple | list | None = None):

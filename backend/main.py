@@ -1,8 +1,8 @@
 """AutoTyper backend API.
 
 Runs on Vercel Python serverless (or any ASGI host). Holds the only copies of
-the Turso token and Juspay secret. The desktop client talks to this over HTTPS
-and never sees those secrets.
+the Turso token and Gmail credentials. The desktop client talks to this over
+HTTPS and never sees those secrets.
 
 Responsibilities:
 - auth: signup / login (JWT)
@@ -112,6 +112,8 @@ class BuyOut(BaseModel):
     pay_url: str
     amount_paise: int
     currency: str
+    # Present only for the UPI provider so the client can render a QR / intent.
+    upi_uri: str = ""
 
 
 class OrderStatusOut(BaseModel):
@@ -220,10 +222,19 @@ def _absolutize(request: Request, url: str) -> str:
 
 @app.post("/payments/buy", response_model=BuyOut)
 def buy_hours(body: BuyIn, request: Request, user: dict = Depends(current_user)):
+    _ensure_db()
     settings = get_settings()
     provider = get_provider()
-    amount_paise = int(round(body.hours * settings.price_per_hour_paise))
+    base_amount = int(round(body.hours * settings.price_per_hour_paise))
     order_id = str(uuid.uuid4())
+
+    expires_at = None
+    if provider.name == "upi_gmail":
+        # Reserve a unique amount so the bank credit-alert maps to one order.
+        amount_paise = _reserve_unique_upi_amount(base_amount)
+        expires_at = _future(settings.upi_order_ttl_minutes)
+    else:
+        amount_paise = base_amount
 
     created = provider.create_order(
         order_id=order_id,
@@ -233,16 +244,49 @@ def buy_hours(body: BuyIn, request: Request, user: dict = Depends(current_user))
     )
     db.execute(
         "INSERT INTO orders (id, user_id, hours, amount_paise, currency, status, "
-        "provider, provider_ref, created_at) VALUES (?, ?, ?, ?, ?, 'created', ?, ?, ?)",
+        "provider, provider_ref, created_at, expires_at) "
+        "VALUES (?, ?, ?, ?, ?, 'created', ?, ?, ?, ?)",
         [order_id, user["id"], body.hours, amount_paise, settings.currency,
-         provider.name, created.provider_ref, _now()],
+         provider.name, created.provider_ref, _now(), expires_at],
     )
     return BuyOut(
         order_id=order_id,
         pay_url=_absolutize(request, created.pay_url),
         amount_paise=amount_paise,
         currency=settings.currency,
+        upi_uri=created.upi_uri,
     )
+
+
+def _future(minutes: int) -> str:
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def _reserve_unique_upi_amount(base_amount: int) -> int:
+    """Pick base_amount + a paise tag not currently used by another pending,
+    unexpired UPI order. Prevents two open orders sharing an amount so an
+    incoming alert is unambiguous."""
+    import random
+    settings = get_settings()
+    now = _now()
+    # Amounts currently in use by open (unexpired, unpaid) UPI orders.
+    taken_rows = db.query_all(
+        "SELECT amount_paise FROM orders WHERE provider = 'upi_gmail' "
+        "AND status = 'created' AND (expires_at IS NULL OR expires_at > ?)",
+        [now],
+    )
+    taken = {int(r["amount_paise"]) for r in taken_rows}
+    lo, hi = settings.upi_tag_min_paise, settings.upi_tag_max_paise
+    candidates = [base_amount + t for t in range(lo, hi + 1)]
+    random.shuffle(candidates)
+    for amt in candidates:
+        if amt not in taken:
+            return amt
+    # All tags in use (many concurrent orders) — fall back to base amount.
+    return base_amount
 
 
 def _credit_order(order_id: str) -> None:
@@ -272,45 +316,6 @@ def order_status(order_id: str, user: dict = Depends(current_user)):
     return OrderStatusOut(order_id=order_id, status=order["status"])
 
 
-@app.post("/payments/webhook/juspay")
-async def juspay_webhook(request: Request):
-    """Called by Juspay on payment status change. Verifies the signature/auth
-    then credits hours when the order is CHARGED.
-
-    Juspay's payload nests the order under content.order, and echoes our order id
-    both as order_id and as udf1 (which we set on create). We look in all the
-    likely places so a field-name change doesn't silently drop a payment."""
-    _ensure_db()
-    provider = get_provider()
-    body = await request.body()
-    provider.verify_webhook({k.lower(): v for k, v in request.headers.items()}, body)
-
-    import json
-    try:
-        payload = json.loads(body or b"{}")
-    except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    content = payload.get("content", {}) or {}
-    order = content.get("order", content) if isinstance(content, dict) else {}
-    if not isinstance(order, dict):
-        order = {}
-
-    order_id = (
-        order.get("udf1")
-        or order.get("order_id")
-        or payload.get("order_id")
-    )
-    status_str = str(
-        order.get("status") or payload.get("status") or ""
-    ).upper()
-
-    # Juspay success statuses for a completed charge.
-    if order_id and status_str in ("CHARGED", "SUCCESS", "PAID", "COMPLETED"):
-        _credit_order(order_id)
-    return {"received": True}
-
-
 # ── mock pay page (only meaningful when PAYMENT_PROVIDER=mock) ──
 @app.get("/payments/mock/pay", response_class=HTMLResponse)
 def mock_pay(order_id: str):
@@ -334,9 +339,225 @@ async def mock_confirm(request: Request):
     order_id = form.get("order_id")
     if not order_id:
         raise HTTPException(status_code=400, detail="Missing order_id")
+    order = db.query_one("SELECT * FROM orders WHERE id = ?", [order_id])
     _credit_order(order_id)
+    if order:
+        _log_event("mock", "matched", int(order["amount_paise"]), "",
+                   order_id=order_id, user_id=order["user_id"],
+                   detail=f"mock credited {order['hours']}h")
     return HTMLResponse(
         "<html><body style='font-family:sans-serif;text-align:center;padding:40px'>"
         "<h2>✅ Payment successful</h2><p>Your hours have been added. "
         "You can close this window and return to AutoTyper.</p></body></html>"
     )
+
+
+# ── UPI + Gmail confirmation ────────────────────────────────────
+@app.get("/payments/upi/pay", response_class=HTMLResponse)
+def upi_pay(order_id: str):
+    """Browser pay page for a UPI order: shows the exact amount + upi:// link.
+    The desktop app renders its own QR; this page is a fallback for opening the
+    link on a phone / clicking through to a UPI app."""
+    _ensure_db()
+    order = db.query_one("SELECT * FROM orders WHERE id = ?", [order_id])
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    settings = get_settings()
+    from payments import build_upi_uri
+    amount_paise = int(order["amount_paise"])
+    uri = build_upi_uri(settings.upi_vpa, settings.upi_payee_name, amount_paise,
+                        f"AutoTyper {order_id[:8]}")
+    amount_rs = f"{amount_paise / 100:.2f}"
+    return f"""
+    <html><body style="font-family:sans-serif;text-align:center;padding:40px">
+      <h2>Pay ₹{amount_rs} to add hours</h2>
+      <p>Pay this <b>exact</b> amount by UPI so we can confirm your payment
+         automatically. Do not round it off.</p>
+      <p>UPI ID: <code>{settings.upi_vpa}</code></p>
+      <p><a href="{uri}" style="display:inline-block;padding:12px 24px;
+         background:#0b5;color:#fff;border-radius:8px;text-decoration:none">
+         Open in a UPI app</a></p>
+      <p style="color:#888">After paying, return to AutoTyper — your balance
+         updates automatically within a minute.</p>
+    </body></html>
+    """
+
+
+def _expire_stale_upi_orders() -> None:
+    db.execute(
+        "UPDATE orders SET status = 'expired' WHERE provider = 'upi_gmail' "
+        "AND status = 'created' AND expires_at IS NOT NULL AND expires_at <= ?",
+        [_now()],
+    )
+
+
+def _log_event(source: str, outcome: str, amount_paise=None, bank_ref="",
+               order_id=None, user_id=None, subject="", snippet="", detail="") -> None:
+    """Record every payment signal we see for later verification / auditing."""
+    try:
+        db.execute(
+            "INSERT INTO payment_events (id, created_at, source, outcome, "
+            "amount_paise, bank_ref, order_id, user_id, subject, snippet, detail) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [str(uuid.uuid4()), _now(), source, outcome, amount_paise,
+             bank_ref or None, order_id, user_id, subject[:500], snippet[:500],
+             detail[:500]],
+        )
+    except Exception:
+        # Auditing must never break the payment path.
+        pass
+
+
+def _match_alert_to_order(amount_paise: int, ref: str, source: str = "gmail_poll",
+                          subject: str = "", snippet: str = "") -> bool:
+    """Find one open UPI order with this exact amount and credit it. Logs the
+    outcome (matched / duplicate / unmatched) to payment_events either way.
+    Returns True if an order was credited."""
+    # Dedup: if this bank ref already credited an order, do nothing.
+    if ref:
+        already = db.query_one("SELECT id FROM orders WHERE matched_ref = ?", [ref])
+        if already:
+            _log_event(source, "duplicate", amount_paise, ref,
+                       order_id=already["id"], subject=subject, snippet=snippet,
+                       detail="bank_ref already credited")
+            return False
+    order = db.query_one(
+        "SELECT * FROM orders WHERE provider = 'upi_gmail' AND status = 'created' "
+        "AND amount_paise = ? AND (expires_at IS NULL OR expires_at > ?) "
+        "ORDER BY created_at ASC LIMIT 1",
+        [amount_paise, _now()],
+    )
+    if not order:
+        _log_event(source, "unmatched", amount_paise, ref, subject=subject,
+                   snippet=snippet, detail="no open order for this amount")
+        return False
+    db.execute(
+        "UPDATE orders SET matched_ref = ? WHERE id = ?", [ref or None, order["id"]]
+    )
+    _credit_order(order["id"])
+    _log_event(source, "matched", amount_paise, ref, order_id=order["id"],
+               user_id=order["user_id"], subject=subject, snippet=snippet,
+               detail=f"credited {order['hours']}h")
+    return True
+
+
+@app.api_route("/payments/poll-gmail", methods=["GET", "POST"])
+def poll_gmail(request: Request):
+    """Read recent HDFC credit-alert emails and credit any matching UPI orders.
+
+    Protected by POLL_SECRET. Accepts the secret via:
+      - ?secret=... query param, or
+      - X-Poll-Secret header, or
+      - Authorization: Bearer <CRON_SECRET> (Vercel Cron injects this when a
+        CRON_SECRET env var is set; set CRON_SECRET == POLL_SECRET).
+    Runs on a schedule (Vercel cron) and can also be triggered manually."""
+    _ensure_db()
+    settings = get_settings()
+    auth = request.headers.get("authorization", "")
+    bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    supplied = (
+        request.query_params.get("secret")
+        or request.headers.get("x-poll-secret", "")
+        or bearer
+    )
+    if not settings.poll_secret or supplied != settings.poll_secret:
+        raise HTTPException(status_code=401, detail="Bad poll secret")
+
+    _expire_stale_upi_orders()
+    import gmail_client
+    try:
+        alerts = gmail_client.fetch_recent_alerts()
+    except Exception as e:  # noqa: BLE001
+        _log_event("gmail_poll", "error", detail=str(e))
+        raise HTTPException(status_code=502, detail="Gmail read failed")
+    credited = 0
+    for a in alerts:
+        if _match_alert_to_order(a.amount_paise, a.ref, source="gmail_poll",
+                                 subject=a.subject, snippet=a.snippet):
+            credited += 1
+    return {"checked": len(alerts), "credited": credited}
+
+
+@app.post("/payments/upi/check/{order_id}")
+def upi_check(order_id: str, user: dict = Depends(current_user)):
+    """On-demand check the client calls while waiting: polls Gmail and reports
+    this order's status. Authenticated to the order owner, so no poll secret
+    needed. Rate is naturally limited by the client's poll interval."""
+    _ensure_db()
+    order = db.query_one(
+        "SELECT * FROM orders WHERE id = ? AND user_id = ?", [order_id, user["id"]]
+    )
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order["status"] == "created":
+        _expire_stale_upi_orders()
+        try:
+            import gmail_client
+            for a in gmail_client.fetch_recent_alerts():
+                _match_alert_to_order(a.amount_paise, a.ref, source="gmail_check",
+                                      subject=a.subject, snippet=a.snippet)
+        except Exception as e:  # noqa: BLE001
+            # Gmail hiccup — log and let the client retry on its next poll.
+            _log_event("gmail_check", "error", detail=str(e))
+        order = db.query_one("SELECT * FROM orders WHERE id = ?", [order_id])
+    return {"order_id": order_id, "status": order["status"]}
+
+
+# ── admin / verification (protected by POLL_SECRET) ─────────────
+def _require_admin(request: Request) -> None:
+    settings = get_settings()
+    auth = request.headers.get("authorization", "")
+    bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    supplied = (
+        request.query_params.get("secret")
+        or request.headers.get("x-poll-secret", "")
+        or bearer
+    )
+    if not settings.poll_secret or supplied != settings.poll_secret:
+        raise HTTPException(status_code=401, detail="Admin auth required")
+
+
+@app.get("/admin/orders")
+def admin_orders(request: Request, status: str | None = None, limit: int = 100):
+    """List recent orders (optionally filtered by status) for verification."""
+    _require_admin(request)
+    _ensure_db()
+    limit = max(1, min(limit, 500))
+    if status:
+        rows = db.query_all(
+            "SELECT id, user_id, hours, amount_paise, currency, status, provider, "
+            "provider_ref, matched_ref, created_at, paid_at, expires_at "
+            "FROM orders WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+            [status, limit],
+        )
+    else:
+        rows = db.query_all(
+            "SELECT id, user_id, hours, amount_paise, currency, status, provider, "
+            "provider_ref, matched_ref, created_at, paid_at, expires_at "
+            "FROM orders ORDER BY created_at DESC LIMIT ?",
+            [limit],
+        )
+    return {"count": len(rows), "orders": rows}
+
+
+@app.get("/admin/events")
+def admin_events(request: Request, outcome: str | None = None, limit: int = 100):
+    """List recent payment_events (matched/unmatched/duplicate/error) for audit.
+
+    Use outcome=unmatched to find payments that came in without a matching order
+    (e.g. a user paid the wrong amount) so you can reconcile manually."""
+    _require_admin(request)
+    _ensure_db()
+    limit = max(1, min(limit, 500))
+    if outcome:
+        rows = db.query_all(
+            "SELECT * FROM payment_events WHERE outcome = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            [outcome, limit],
+        )
+    else:
+        rows = db.query_all(
+            "SELECT * FROM payment_events ORDER BY created_at DESC LIMIT ?",
+            [limit],
+        )
+    return {"count": len(rows), "events": rows}

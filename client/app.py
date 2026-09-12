@@ -10,8 +10,8 @@ from __future__ import annotations
 import sys
 import webbrowser
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
     QInputDialog, QLabel, QLineEdit, QMainWindow, QMessageBox, QPushButton,
@@ -33,6 +33,28 @@ def _fmt_hms(secs: float) -> str:
     if m:
         return f"{m}m {s}s"
     return f"{s}s"
+
+
+def _make_qr_pixmap(data: str, size: int = 240):
+    """Render `data` (a upi:// link) to a QPixmap QR code. Returns None if the
+    qrcode library isn't available."""
+    try:
+        import qrcode
+    except Exception:
+        return None
+    qr = qrcode.QRCode(border=2, box_size=8)
+    qr.add_data(data)
+    qr.make(fit=True)
+    matrix = qr.get_matrix()
+    n = len(matrix)
+    img = QImage(n, n, QImage.Format_RGB32)
+    black = 0xFF000000
+    white = 0xFFFFFFFF
+    for y in range(n):
+        for x in range(n):
+            img.setPixel(x, y, black if matrix[y][x] else white)
+    return QPixmap.fromImage(img).scaled(size, size, Qt.KeepAspectRatio,
+                                         Qt.FastTransformation)
 
 
 # ── background worker for one-off API calls ────────────────────
@@ -150,17 +172,30 @@ class RechargeDialog(QDialog):
         self.setWindowTitle("Recharge hours")
         self.setModal(True)
         self._order_id = None
+        self._upi_uri = ""
 
         self.hours = QSpinBox()
         self.hours.setRange(1, 100)
         self.hours.setValue(1)
         self.hours.setSuffix(" hour(s)")
 
-        self.buy_btn = QPushButton("Buy & open payment page")
+        self.buy_btn = QPushButton("Buy hours")
         self.buy_btn.clicked.connect(self._buy)
 
-        self.status = QLabel("Choose how many hours to add.")
+        # QR + amount shown after an order is created.
+        self.qr_label = QLabel()
+        self.qr_label.setAlignment(Qt.AlignCenter)
+        self.qr_label.setVisible(False)
+        self.amount_label = QLabel()
+        self.amount_label.setAlignment(Qt.AlignCenter)
+        self.amount_label.setStyleSheet("font-size:16px; font-weight:600")
+        self.open_app_btn = QPushButton("Open in a UPI app")
+        self.open_app_btn.clicked.connect(self._open_upi_app)
+        self.open_app_btn.setVisible(False)
+
+        self.status = QLabel("Choose how many hours to add, then pay by UPI.")
         self.status.setWordWrap(True)
+        self.status.setAlignment(Qt.AlignCenter)
 
         form = QFormLayout()
         form.addRow("Hours", self.hours)
@@ -168,14 +203,19 @@ class RechargeDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self.buy_btn)
+        layout.addWidget(self.amount_label)
+        layout.addWidget(self.qr_label)
+        layout.addWidget(self.open_app_btn)
         layout.addWidget(self.status)
 
+        # On-demand confirmation polling while the user pays.
         self._poll = QTimer(self)
-        self._poll.setInterval(3000)
+        self._poll.setInterval(4000)
         self._poll.timeout.connect(self._check_status)
 
     def _buy(self):
         self.buy_btn.setEnabled(False)
+        self.hours.setEnabled(False)
         self.status.setText("Creating order…")
         run_async(
             self,
@@ -187,19 +227,51 @@ class RechargeDialog(QDialog):
     def _order_created(self, order):
         self._order_id = order["order_id"]
         amount = order["amount_paise"] / 100
-        webbrowser.open(order["pay_url"])
-        self.status.setText(
-            f"Opened payment page for ₹{amount:.2f}. "
-            "Complete the payment, then wait here — your hours are added automatically."
-        )
+        self._upi_uri = order.get("upi_uri", "")
+
+        if self._upi_uri:
+            # UPI flow: show a QR of the exact-amount upi:// link + a button.
+            self.amount_label.setText(f"Pay exactly ₹{amount:.2f}")
+            pix = _make_qr_pixmap(self._upi_uri)
+            if pix is not None:
+                self.qr_label.setPixmap(pix)
+                self.qr_label.setVisible(True)
+            self.open_app_btn.setVisible(True)
+            self.status.setText(
+                "Scan the QR with any UPI app, or tap ‘Open in a UPI app’. "
+                "Pay the exact amount shown — it identifies your payment. "
+                "Your hours are added automatically once the payment lands."
+            )
+        else:
+            # Mock/other flow: open the returned pay page in a browser.
+            webbrowser.open(order["pay_url"])
+            self.amount_label.setText(f"₹{amount:.2f}")
+            self.status.setText(
+                f"Opened payment page for ₹{amount:.2f}. Complete it, then wait "
+                "here — your hours are added automatically."
+            )
         self._poll.start()
+
+    def _open_upi_app(self):
+        if self._upi_uri:
+            # Opens the upi:// deep link in the OS-registered UPI handler.
+            webbrowser.open(self._upi_uri)
 
     def _check_status(self):
         if not self._order_id:
             return
+
+        def check():
+            # For UPI, ask the backend to read Gmail now; falls back to plain
+            # status for the mock provider.
+            try:
+                return self.api.upi_check(self._order_id)
+            except ApiError:
+                return self.api.order_status(self._order_id)
+
         run_async(
             self,
-            lambda: self.api.order_status(self._order_id),
+            check,
             on_done=self._status_result,
             on_fail=lambda _msg: None,  # keep polling on transient errors
         )
@@ -210,9 +282,13 @@ class RechargeDialog(QDialog):
             self.status.setText("✅ Payment confirmed. Hours added.")
             self.credited.emit()
             QTimer.singleShot(1200, self.accept)
+        elif res.get("status") == "expired":
+            self._poll.stop()
+            self.status.setText("This order expired. Close and try again.")
 
     def _err(self, msg):
         self.buy_btn.setEnabled(True)
+        self.hours.setEnabled(True)
         self.status.setText(f"Error: {msg}")
 
 

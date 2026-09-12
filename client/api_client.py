@@ -91,6 +91,11 @@ class ApiClient:
     def order_status(self, order_id: str) -> dict:
         return self._get(f"/payments/status/{order_id}")
 
+    def upi_check(self, order_id: str) -> dict:
+        """On-demand: ask the backend to read recent bank alerts and confirm
+        this order. Returns {'order_id', 'status'}."""
+        return self._post(f"/payments/upi/check/{order_id}", {})
+
 
 def _extract_detail(resp: httpx.Response) -> str:
     try:

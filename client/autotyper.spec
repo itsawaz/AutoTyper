@@ -24,6 +24,8 @@ hidden = [
     "pynput.mouse._darwin",
     "pynput.mouse._win32",
     "pynput.mouse._xorg",
+    "qrcode",
+    "qrcode.image.pil",
 ]
 
 a = Analysis(

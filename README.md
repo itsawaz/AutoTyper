@@ -16,10 +16,10 @@ It has two parts:
  │  (client/)   │   login / balance    │  (backend/)      │   SQL  │  (data) │
  │              │   session heartbeat  │  holds secrets   │        └─────────┘
  └──────────────┘   buy hours          └──────────────────┘
-                                              │  webhook / confirm
-                                              ▼
-                                        Payment provider
-                                        (mock  ➜  Juspay)
+                                              │  reads bank credit-alert
+                                              ▼  emails to confirm UPI payments
+                                        Gmail API (read-only)
+                                        (mock provider for local dev)
 ```
 
 ## Why the split (please read before changing it)
@@ -42,10 +42,15 @@ instead of hitting Turso directly.
 - `POST /session/heartbeat` → client reports elapsed active seconds; server
   debits the balance and replies `should_stop` when it hits zero.
 - `POST /session/stop` → closes the session.
-- `POST /payments/buy` → creates an order, returns a payment URL.
-- `POST /payments/webhook/juspay` → gateway calls this to confirm payment; hours
-  are credited (idempotently).
+- `POST /payments/buy` → creates an order; for UPI it reserves a unique amount
+  and returns a `upi://` link + pay page URL.
 - `GET  /payments/status/{order_id}` → client polls until `paid`.
+- `POST /payments/upi/check/{order_id}` → on-demand: reads recent bank alerts and
+  confirms this order (used by the client while the user waits).
+- `POST /payments/poll-gmail` → scheduled/batch poll of Gmail that credits any
+  matching UPI orders (protected by `POLL_SECRET`).
+- `GET  /admin/orders`, `GET /admin/events` → audit/verification views
+  (protected by `POLL_SECRET`).
 - Mock provider only: `/payments/mock/pay` + `/payments/mock/confirm` simulate a
   successful payment so the whole flow works with zero setup.
 
@@ -90,56 +95,93 @@ uvicorn main:app --reload --port 8000
 1. Install the CLI: `npm i -g vercel` (or use the Vercel dashboard + Git import).
 2. From `backend/`: `vercel` then `vercel --prod`.
 3. In the Vercel project settings, add the same environment variables from your
-   `.env` (TURSO_*, JWT_SECRET, PAYMENT_PROVIDER, and the JUSPAY_* + pricing when
-   you go live).
+   `.env` (TURSO_*, JWT_SECRET, PAYMENT_PROVIDER, UPI_*, GMAIL_*, POLL_SECRET,
+   and pricing).
 4. Your API is now at `https://<project>.vercel.app`. The `vercel.json` routes
    all paths to the FastAPI app in `api/index.py`.
 
 > Free tier is comfortable for ~10–15 users. Turso holds the data so a redeploy
 > never loses balances.
 
-### Going live with Juspay
+### Payments: free UPI + Gmail confirmation (no gateway, no KYC)
 
-The payment layer is behind an interface (`backend/payments.py`) with two
-implementations:
+The payment layer is behind an interface (`backend/payments.py`):
 
-- `mock` (default): no real money; the buy flow completes via the mock pages.
-- `juspay`: real order create + webhook confirmation.
-
-To switch to real payments:
-
-1. Create a Juspay merchant account and get your **API key**, **merchant id**,
-   and (in the dashboard's webhook settings) set a **webhook HMAC secret**.
-2. Set these env vars (locally in `.env`, and in Vercel project settings):
-   ```
-   PAYMENT_PROVIDER=juspay
-   JUSPAY_API_KEY=...
-   JUSPAY_MERCHANT_ID=...
-   JUSPAY_BASE_URL=https://sandbox.juspay.in     # or the production base URL
-   JUSPAY_WEBHOOK_SECRET=...                      # same value as the dashboard
-   PAYMENT_RETURN_URL=https://<project>.vercel.app/payments/return  # or your page
-   ```
-3. In the Juspay dashboard, point the webhook at
-   `https://<project>.vercel.app/payments/webhook/juspay`.
+- `mock`: no real money; the buy flow completes via the mock pages (local dev).
+- `upi_gmail` (default): real UPI collection confirmed by reading your bank's
+  credit-alert emails. No payment gateway and no GST/merchant KYC.
 
 How it works:
 
-- `create_order` calls Juspay's server-to-server Orders API and hands the
-  returned **web payment link** to the client to open in a browser. We pass our
-  own order id as both `order_id` and `udf1`.
-- On payment completion Juspay POSTs a webhook. We verify it via **HMAC-SHA256**
-  (using `JUSPAY_WEBHOOK_SECRET`), optionally plus HTTP Basic auth, then credit
-  hours when the order status is `CHARGED` (idempotently — replays don't
-  double-credit).
+1. **Buy** — the backend reserves a **unique amount** for the order: the base
+   price plus a random paise tag (e.g. ₹49.00 → ₹49.37). This makes an incoming
+   bank alert map to exactly one order. It returns a `upi://pay?...` link.
+2. **Pay** — the user pays that exact amount from any UPI app to your VPA. The
+   money lands in your bank.
+3. **Confirm** — your bank emails a credit alert. The backend reads recent alert
+   emails via the Gmail API, parses the amount + UPI reference, matches it to the
+   pending order, and credits the hours. Confirmation is **idempotent** (a bank
+   reference credits at most one order) and every alert seen is logged to
+   `payment_events` for later verification.
 
-Test in **sandbox** first with `JUSPAY_BASE_URL=https://sandbox.juspay.in` and
-sandbox credentials before switching to the production base URL. The mock
-provider (`PAYMENT_PROVIDER=mock`) remains available for local testing without
-any Juspay account.
+Two confirmation triggers:
 
-> The integration follows Juspay's documented Orders API and HMAC-SHA256 webhook
-> verification. Confirm exact field names / the production base URL against your
-> own merchant dashboard, since these can vary by account and region.
+- **On-demand** (fast): while the user waits, the client calls
+  `POST /payments/upi/check/{order_id}` every few seconds; that reads Gmail and
+  confirms immediately.
+- **Scheduled** (safety net): a Vercel cron hits `POST /payments/poll-gmail`.
+  Note the Vercel **Hobby (free) plan runs crons at most once per day** — the
+  on-demand check is what makes confirmation fast; the cron just catches anything
+  missed. Set `CRON_SECRET` == `POLL_SECRET` in Vercel so the cron authenticates.
+
+#### One-time setup
+
+1. **UPI**: set your receiving VPA and payee name:
+   ```
+   PAYMENT_PROVIDER=upi_gmail
+   UPI_VPA=your-vpa@bank
+   UPI_PAYEE_NAME=AutoTyper
+   ```
+2. **Bank parser**: set `UPI_BANK_PARSER` to your bank (`hdfc`, `paytm`, or
+   `generic`) and `UPI_ALERT_SENDER` to the exact sender address of your bank's
+   alert emails (e.g. `alerts@hdfcbank.bank.in`). Only emails from that sender
+   are trusted, which blocks spoofed alerts.
+3. **Gmail (read-only)**:
+   - Create a Google Cloud project and **enable the Gmail API**.
+   - Create an OAuth client of type **Desktop app** → gives a client id/secret.
+   - Run the helper to mint a refresh token (opens a browser, asks for read-only
+     Gmail access):
+     ```bash
+     cd backend
+     GMAIL_CLIENT_ID=... GMAIL_CLIENT_SECRET=... python get_gmail_token.py
+     ```
+   - Put `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN` in env.
+   - In Gmail, create a **filter** on your bank's alert sender that applies a
+     label (default `upi-alerts`), and set `GMAIL_LABEL` to it. The poller only
+     reads that label.
+4. **Poll secret**: set a strong `POLL_SECRET` (and the same value as
+   `CRON_SECRET` in Vercel so the scheduled poll authenticates).
+
+#### Reconciliation / verification
+
+Every credit alert is recorded in `payment_events` with its outcome:
+
+- `matched` — credited an order (includes order id, amount, bank ref).
+- `duplicate` — a bank ref already credited; ignored.
+- `unmatched` — a payment arrived with no open order for that amount (e.g. the
+  user paid the wrong amount) — reconcile these manually.
+- `error` — a Gmail read failure.
+
+View them:
+```bash
+curl "https://<project>.vercel.app/admin/events?secret=$POLL_SECRET"
+curl "https://<project>.vercel.app/admin/orders?status=paid&secret=$POLL_SECRET"
+```
+
+> Honest limits: this is a DIY confirmation, not a certified gateway — no
+> settlement guarantee, no automatic refunds/disputes. Bank email formats can
+> change and need a small parser tweak. Fine for a small user base; the mock
+> provider remains available for local testing.
 
 ---
 
@@ -214,7 +256,9 @@ AutoTyper/
 │   ├── main.py             # API routes (auth, balance, sessions, payments)
 │   ├── auth.py             # bcrypt password hashing + JWT
 │   ├── db.py               # Turso/libSQL access + schema
-│   ├── payments.py         # MockProvider + JuspayProvider behind get_provider()
+│   ├── payments.py         # MockProvider + UpiGmailProvider behind get_provider()
+│   ├── gmail_client.py     # Gmail reader + bank credit-alert parsers
+│   ├── get_gmail_token.py  # one-time helper to mint a Gmail refresh token
 │   ├── config.py           # env-driven settings
 │   ├── vercel.json         # routes all paths to the app
 │   ├── requirements.txt
@@ -235,8 +279,8 @@ AutoTyper/
 ## Notes & limits
 
 - Use **Python 3.11 / 3.12** everywhere; 3.14 breaks native wheels.
-- The mock payment provider is for testing only — switch to `juspay` for real
-  money.
+- The mock payment provider is for testing only — use `upi_gmail` for real
+  payments.
 - Session time is enforced by the backend; the client is not trusted with it.
 
 ## License
