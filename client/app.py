@@ -7,8 +7,16 @@ reports active time and stops when the server says the balance is exhausted.
 """
 from __future__ import annotations
 
+import logging
+import os
 import sys
 import webbrowser
+
+# Ensure the GUI uses the native platform plugin. Clear any stray QT_QPA_PLATFORM
+# (e.g. "offscreen" left in the environment) that would otherwise start the app
+# headless / fail to show a window. Must happen before QApplication is created.
+if os.environ.get("QT_QPA_PLATFORM"):
+    os.environ.pop("QT_QPA_PLATFORM", None)
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QImage, QPixmap
@@ -23,6 +31,13 @@ from api_client import ApiClient, ApiError
 from hotkey import HotkeyManager
 from typer_engine import TyperEngine
 
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s [%(threadName)s] %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("autotyper")
+
 
 def _fmt_hms(secs: float) -> str:
     secs = int(max(0, secs))
@@ -35,39 +50,42 @@ def _fmt_hms(secs: float) -> str:
     return f"{s}s"
 
 
-def _make_qr_pixmap(data: str, target: int = 280):
-    """Render `data` (a upi:// link) to a crisp, scannable QPixmap QR code.
+def _make_qr_pixmap(data: str, box_size: int = 8):
+    """Render `data` (a upi:// link) to a scannable QPixmap QR code.
 
-    Key correctness points for scannability:
-      - a wide quiet zone (border=4 modules, the QR spec minimum),
-      - integer scaling so module edges stay sharp (no blur),
-      - high error correction so phone cameras lock on more easily.
-    Returns None if the qrcode library isn't available.
+    We use qrcode's own PIL renderer (well-tested, produces a clean quiet zone
+    and sharp modules), export it to PNG bytes, and load that into a QPixmap.
+    This avoids hand-rolling pixel data into a QImage, which previously produced
+    an unscannable code. Returns None if the libraries aren't available.
     """
     try:
+        import io
         import qrcode
         from qrcode.constants import ERROR_CORRECT_M
     except Exception:
+        log.exception("QR: qrcode import failed")
         return None
-    qr = qrcode.QRCode(error_correction=ERROR_CORRECT_M, border=4, box_size=1)
-    qr.add_data(data)
-    qr.make(fit=True)
-    matrix = qr.get_matrix()
-    n = len(matrix)  # includes the border quiet zone
-
-    # Base 1px-per-module image, then scale up by an integer factor so every
-    # module is an exact block of pixels (sharp edges = reliably scannable).
-    base = QImage(n, n, QImage.Format_RGB32)
-    black = 0xFF000000
-    white = 0xFFFFFFFF
-    for y in range(n):
-        for x in range(n):
-            base.setPixel(x, y, black if matrix[y][x] else white)
-
-    scale = max(1, target // n)
-    px = QPixmap.fromImage(base)
-    return px.scaled(n * scale, n * scale, Qt.KeepAspectRatio,
-                     Qt.FastTransformation)
+    try:
+        qr = qrcode.QRCode(
+            error_correction=ERROR_CORRECT_M,
+            border=4,           # spec-minimum quiet zone
+            box_size=box_size,  # pixels per module -> crisp, no rescaling
+        )
+        qr.add_data(data)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        pix = QPixmap()
+        ok = pix.loadFromData(buf.getvalue(), "PNG")
+        if not ok:
+            log.error("QR: QPixmap.loadFromData failed")
+            return None
+        log.debug("QR rendered: %dx%d px", pix.width(), pix.height())
+        return pix
+    except Exception:
+        log.exception("QR: rendering failed")
+        return None
 
 
 # ── background worker for one-off API calls ────────────────────
@@ -80,11 +98,16 @@ class Worker(QObject):
         self._fn = fn
 
     def run(self):
+        log.debug("Worker.run start")
         try:
-            self.done.emit(self._fn())
+            result = self._fn()
+            log.debug("Worker.run success, emitting done")
+            self.done.emit(result)
         except ApiError as e:
+            log.warning("Worker.run ApiError: %s", e.message)
             self.failed.emit(e.message)
         except Exception as e:  # noqa: BLE001
+            log.exception("Worker.run unexpected error")
             self.failed.emit(str(e))
 
 
@@ -96,20 +119,35 @@ def run_async(parent, fn, on_done=None, on_fail=None):
     Thread/worker refs are held on `parent` until the thread finishes, then
     released, so nothing is garbage-collected mid-run.
     """
+    log.debug("run_async: starting thread")
     thread = QThread(parent)
     worker = Worker(fn)
     worker.moveToThread(thread)
     thread.started.connect(worker.run)
 
-    if on_done:
-        worker.done.connect(on_done)
-    if on_fail:
-        worker.failed.connect(on_fail)
+    # IMPORTANT: worker.done/failed are emitted on the WORKER thread. If we
+    # connect plain Python callables directly, Qt (AutoConnection) runs them on
+    # the worker thread — so touching widgets (e.g. dialog.accept()) crashes /
+    # deadlocks with "Cannot filter events for objects in a different thread".
+    # We marshal every user callback onto the UI thread via QTimer.singleShot(0)
+    # bound to `parent`, which lives on the UI thread.
+    def _deliver(cb, value):
+        QTimer.singleShot(0, parent, lambda: cb(value))
 
-    # When the work finishes (either signal), ask the thread's event loop to
-    # quit. This does NOT block the UI thread.
-    worker.done.connect(lambda *_: thread.quit())
-    worker.failed.connect(lambda *_: thread.quit())
+    def _on_done(value):
+        log.debug("run_async: done received on %s, marshalling to UI thread",
+                  QThread.currentThread())
+        thread.quit()
+        if on_done:
+            _deliver(on_done, value)
+
+    def _on_fail(msg):
+        thread.quit()
+        if on_fail:
+            _deliver(on_fail, msg)
+
+    worker.done.connect(_on_done)
+    worker.failed.connect(_on_fail)
 
     # Keep strong refs so neither is collected while running.
     parent._threads = getattr(parent, "_threads", [])
@@ -172,6 +210,8 @@ class LoginDialog(QDialog):
     def _submit(self, fn):
         email = self.email.text().strip()
         pw = self.password.text()
+        log.debug("submit: email=%r pw_len=%d api_base=%s", email, len(pw),
+                  self.api.base_url)
         if not email or len(pw) < 8:
             self.status.setText("Enter an email and a password of 8+ characters.")
             return
@@ -184,10 +224,13 @@ class LoginDialog(QDialog):
         )
 
     def _ok(self, email, token):
+        log.debug("signup/login OK, token_len=%d, saving config + accepting",
+                  len(token or ""))
         config.update(token=token, email=email)
         self.accept()
 
     def _err(self, msg):
+        log.warning("signup/login failed: %s", msg)
         self._set_busy(False)
         self.status.setText(msg)
 
@@ -361,6 +404,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, api: ApiClient, cfg: dict):
         super().__init__()
+        log.debug("MainWindow.__init__ start")
         self.api = api
         self.cfg = cfg
         self.session_id = None
@@ -412,8 +456,13 @@ class MainWindow(QMainWindow):
             idle_resume_secs=float(self.cfg.get("idle_resume_secs", 5.0)),
         )
         self.hotkeys = HotkeyManager()
-        self._install_hotkey(self.cfg["hotkey"])
+        self._hotkey_ok = True
+        # Defer starting the global hotkey listener until AFTER the window is
+        # shown and the event loop is running. On macOS pynput's global listener
+        # can hard-crash if started during construction / before the app is
+        # fully up; deferring lets the window appear first and isolates the risk.
         self._update_hotkey_label()
+        QTimer.singleShot(300, lambda: self._install_hotkey(self.cfg["hotkey"]))
 
         # Heartbeat responses come from the engine's worker thread; marshal to UI.
         self._hb_result.connect(self._on_hb_result)
@@ -524,10 +573,13 @@ class MainWindow(QMainWindow):
 
     # ── hotkey ─────────────────────────────────────────────────
     def _install_hotkey(self, combo: str):
+        log.debug("installing global hotkey: %r", combo)
         self._hotkey_ok = True
         try:
             self.hotkeys.start(combo, self._hotkey_fired)
+            log.debug("global hotkey listener started")
         except Exception:
+            log.exception("hotkey listener failed to start (continuing without it)")
             self._hotkey_ok = False
         self._update_hotkey_label()
 
@@ -583,6 +635,8 @@ def main():
     app.setApplicationName("AutoTyper")
 
     cfg = config.load()
+    log.info("AutoTyper starting. api_base=%s  have_token=%s",
+             cfg["api_base"], bool(cfg.get("token")))
     api = ApiClient(cfg["api_base"], token=cfg.get("token", ""))
 
     # If we have a token, verify it by fetching balance; else show login.
@@ -600,8 +654,11 @@ def main():
 
     cfg = config.load()  # token may have been updated by login
     api.token = cfg["token"]
+    log.debug("main: constructing MainWindow")
     win = MainWindow(api, cfg)
+    log.debug("main: MainWindow constructed, showing")
     win.show()
+    log.debug("main: entering event loop")
     return app.exec()
 
 
