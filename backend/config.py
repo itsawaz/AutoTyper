@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     juspay_base_url: str = "https://sandbox.juspay.in"
     juspay_webhook_username: str = ""
     juspay_webhook_password: str = ""
+    # Shared secret Juspay uses to HMAC-SHA256 sign webhook payloads. Configure
+    # the same value in the Juspay dashboard webhook settings.
+    juspay_webhook_secret: str = ""
     payment_return_url: str = "https://example.com/payment-return"
 
     # Pricing

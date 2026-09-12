@@ -106,13 +106,40 @@ implementations:
 - `mock` (default): no real money; the buy flow completes via the mock pages.
 - `juspay`: real order create + webhook confirmation.
 
-To switch: set `PAYMENT_PROVIDER=juspay` and fill in `JUSPAY_API_KEY`,
-`JUSPAY_MERCHANT_ID`, `JUSPAY_BASE_URL` (sandbox vs prod), and the webhook
-credentials. Point your Juspay webhook at
-`https://<project>.vercel.app/payments/webhook/juspay`. Hours are credited when
-the order status is `CHARGED`. The `JuspayProvider` is written against Juspay's
-Orders API shape; verify field names against your merchant dashboard before
-production.
+To switch to real payments:
+
+1. Create a Juspay merchant account and get your **API key**, **merchant id**,
+   and (in the dashboard's webhook settings) set a **webhook HMAC secret**.
+2. Set these env vars (locally in `.env`, and in Vercel project settings):
+   ```
+   PAYMENT_PROVIDER=juspay
+   JUSPAY_API_KEY=...
+   JUSPAY_MERCHANT_ID=...
+   JUSPAY_BASE_URL=https://sandbox.juspay.in     # or the production base URL
+   JUSPAY_WEBHOOK_SECRET=...                      # same value as the dashboard
+   PAYMENT_RETURN_URL=https://<project>.vercel.app/payments/return  # or your page
+   ```
+3. In the Juspay dashboard, point the webhook at
+   `https://<project>.vercel.app/payments/webhook/juspay`.
+
+How it works:
+
+- `create_order` calls Juspay's server-to-server Orders API and hands the
+  returned **web payment link** to the client to open in a browser. We pass our
+  own order id as both `order_id` and `udf1`.
+- On payment completion Juspay POSTs a webhook. We verify it via **HMAC-SHA256**
+  (using `JUSPAY_WEBHOOK_SECRET`), optionally plus HTTP Basic auth, then credit
+  hours when the order status is `CHARGED` (idempotently — replays don't
+  double-credit).
+
+Test in **sandbox** first with `JUSPAY_BASE_URL=https://sandbox.juspay.in` and
+sandbox credentials before switching to the production base URL. The mock
+provider (`PAYMENT_PROVIDER=mock`) remains available for local testing without
+any Juspay account.
+
+> The integration follows Juspay's documented Orders API and HMAC-SHA256 webhook
+> verification. Confirm exact field names / the production base URL against your
+> own merchant dashboard, since these can vary by account and region.
 
 ---
 

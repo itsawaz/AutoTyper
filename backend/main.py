@@ -17,7 +17,8 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, EmailStr, Field
 
 import db
@@ -32,16 +33,38 @@ from payments import get_provider
 
 app = FastAPI(title="AutoTyper API", version="1.0.0")
 
+# The desktop client isn't a browser so it doesn't need CORS, but the payment
+# pages open in a browser and a future web checkout might too. Permissive here
+# is safe because every sensitive route requires a bearer token anyway.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 # ── lifecycle ──────────────────────────────────────────────────
+# On serverless, startup hooks don't fire reliably per cold-started instance,
+# so we also lazily ensure the schema exists on the first request that needs it.
+_db_ready = False
+
+
+def _ensure_db() -> None:
+    global _db_ready
+    if _db_ready:
+        return
+    db.init_db()
+    _db_ready = True
+
+
 @app.on_event("startup")
 def _startup():
-    # Cheap and idempotent; fine on serverless cold starts.
     try:
-        db.init_db()
+        _ensure_db()
     except Exception:
-        # Don't crash the whole app if the DB is briefly unreachable on cold
-        # start; individual requests will surface the real error.
+        # Don't crash the app if the DB is briefly unreachable on cold start;
+        # requests will call _ensure_db() again and surface the real error.
         pass
 
 
@@ -105,6 +128,7 @@ def health():
 # ── auth ───────────────────────────────────────────────────────
 @app.post("/auth/signup", response_model=TokenOut)
 def signup(body: Credentials):
+    _ensure_db()
     existing = db.query_one("SELECT id FROM users WHERE email = ?", [body.email.lower()])
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
@@ -119,6 +143,7 @@ def signup(body: Credentials):
 
 @app.post("/auth/login", response_model=TokenOut)
 def login(body: Credentials):
+    _ensure_db()
     user = db.query_one("SELECT * FROM users WHERE email = ?", [body.email.lower()])
     if not user or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
@@ -249,17 +274,39 @@ def order_status(order_id: str, user: dict = Depends(current_user)):
 
 @app.post("/payments/webhook/juspay")
 async def juspay_webhook(request: Request):
-    """Called by Juspay on payment status change. Verifies auth then credits."""
+    """Called by Juspay on payment status change. Verifies the signature/auth
+    then credits hours when the order is CHARGED.
+
+    Juspay's payload nests the order under content.order, and echoes our order id
+    both as order_id and as udf1 (which we set on create). We look in all the
+    likely places so a field-name change doesn't silently drop a payment."""
+    _ensure_db()
     provider = get_provider()
     body = await request.body()
     provider.verify_webhook({k.lower(): v for k, v in request.headers.items()}, body)
 
     import json
-    payload = json.loads(body or b"{}")
-    content = payload.get("content", {}).get("order", payload)
-    order_id = content.get("order_id") or content.get("udf1")
-    status_str = (content.get("status") or "").upper()
-    if order_id and status_str in ("CHARGED", "SUCCESS", "PAID"):
+    try:
+        payload = json.loads(body or b"{}")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    content = payload.get("content", {}) or {}
+    order = content.get("order", content) if isinstance(content, dict) else {}
+    if not isinstance(order, dict):
+        order = {}
+
+    order_id = (
+        order.get("udf1")
+        or order.get("order_id")
+        or payload.get("order_id")
+    )
+    status_str = str(
+        order.get("status") or payload.get("status") or ""
+    ).upper()
+
+    # Juspay success statuses for a completed charge.
+    if order_id and status_str in ("CHARGED", "SUCCESS", "PAID", "COMPLETED"):
         _credit_order(order_id)
     return {"received": True}
 
