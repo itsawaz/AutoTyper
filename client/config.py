@@ -13,7 +13,7 @@ from pathlib import Path
 # Backend base URL. Overridable via env so the same build can point at a local
 # dev server or the deployed Vercel URL without recompiling.
 DEFAULT_API_BASE = os.environ.get(
-    "AUTOTYPER_API_BASE", "http://127.0.0.1:8000"
+    "AUTOTYPER_API_BASE", "https://backend-six-pi-35.vercel.app"
 )
 
 APP_DIR = Path.home() / ".autotyper"
