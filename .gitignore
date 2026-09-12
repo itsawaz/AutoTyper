@@ -30,3 +30,18 @@ TEST.TXT
 
 # Logs
 *.log
+
+# Backend / client virtualenvs and env files
+backend/.venv/
+client/.venv/
+.venv/
+backend/.env
+client/.env
+
+# PyInstaller build output
+client/build/
+client/dist/
+*.spec.bak
+
+# Vercel
+.vercel/
